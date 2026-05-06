@@ -203,7 +203,11 @@ func parseNullableInt64(value []byte) (*int64, error) {
 // helper function to format column list for snapshot queries
 func selectSnapshotColumns(columns []string) string {
 	if len(columns) > 0 {
-		return strings.Join(columns, ", ")
+		quotedColumns := make([]string, 0, len(columns))
+		for _, column := range columns {
+			quotedColumns = append(quotedColumns, pq.QuoteIdentifier(column))
+		}
+		return strings.Join(quotedColumns, ", ")
 	}
 	return "*"
 }

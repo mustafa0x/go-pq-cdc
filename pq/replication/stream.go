@@ -626,8 +626,8 @@ func (s *stream) fetchSnapshotLSN(ctx context.Context) (pq.LSN, error) {
 			query := fmt.Sprintf(`
 				SELECT snapshot_lsn, completed 
 				FROM cdc_snapshot_job 
-				WHERE slot_name = '%s'
-			`, s.config.Slot.Name)
+				WHERE slot_name = %s
+			`, pq.QuoteLiteral(s.config.Slot.Name))
 
 			resultReader := conn.Exec(ctx, query)
 			results, err := resultReader.ReadAll()

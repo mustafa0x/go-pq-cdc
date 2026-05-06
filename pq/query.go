@@ -39,9 +39,9 @@ func TableExists(ctx context.Context, conn Connection, schema, table string) (bo
 		SELECT EXISTS (
 			SELECT 1
 			FROM information_schema.tables
-			WHERE table_schema = '%s'
-			AND table_name = '%s'
-		)`, schema, table)
+			WHERE table_schema = %s
+			AND table_name = %s
+		)`, QuoteLiteral(schema), QuoteLiteral(table))
 
 	return ExecExistsQuery(ctx, conn, query)
 }
@@ -52,9 +52,9 @@ func IndexExists(ctx context.Context, conn Connection, schema, index string) (bo
 		SELECT EXISTS (
 			SELECT 1
 			FROM pg_indexes
-			WHERE schemaname = '%s'
-			AND indexname = '%s'
-		)`, schema, index)
+			WHERE schemaname = %s
+			AND indexname = %s
+		)`, QuoteLiteral(schema), QuoteLiteral(index))
 
 	return ExecExistsQuery(ctx, conn, query)
 }
