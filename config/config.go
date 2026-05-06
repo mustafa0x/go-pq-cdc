@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -42,7 +44,7 @@ type LoggerConfig struct {
 }
 
 type ExtensionSupport struct {
-	EnableTimeScaleDB bool `json:"enableTimeScaleDB" yaml:"EnableTimeScaleDB"`
+	EnableTimeScaleDB bool `json:"enableTimeScaleDB" yaml:"enableTimescaleDB"`
 }
 
 type HeartbeatConfig struct {
@@ -53,17 +55,37 @@ type HeartbeatConfig struct {
 // DSN returns a normal PostgreSQL connection string for regular database operations
 // (publication, metadata, snapshot chunks, etc.)
 func (c *Config) DSN() string {
-	return fmt.Sprintf("postgres://%s:%s@%s:%d/%s", url.QueryEscape(c.Username), url.QueryEscape(c.Password), c.Host, c.Port, c.Database)
+	return c.buildDSN(false, false)
 }
 
 // ReplicationDSN returns a replication connection string for CDC streaming
 // This connection counts against max_wal_senders limit
 func (c *Config) ReplicationDSN() string {
-	return fmt.Sprintf("postgres://%s:%s@%s:%d/%s?replication=database", url.QueryEscape(c.Username), url.QueryEscape(c.Password), c.Host, c.Port, c.Database)
+	return c.buildDSN(true, false)
 }
 
 func (c *Config) DSNWithoutSSL() string {
-	return fmt.Sprintf("postgres://%s:%s@%s:%d/%s?sslmode=disable", url.QueryEscape(c.Username), url.QueryEscape(c.Password), c.Host, c.Port, c.Database)
+	return c.buildDSN(false, true)
+}
+
+func (c *Config) buildDSN(replication, disableSSL bool) string {
+	u := &url.URL{
+		Scheme: "postgres",
+		User:   url.UserPassword(c.Username, c.Password),
+		Host:   net.JoinHostPort(c.Host, strconv.Itoa(c.Port)),
+		Path:   c.Database,
+	}
+
+	q := u.Query()
+	if replication {
+		q.Set("replication", "database")
+	}
+	if disableSSL {
+		q.Set("sslmode", "disable")
+	}
+	u.RawQuery = q.Encode()
+
+	return u.String()
 }
 
 func (c *Config) SetDefault() {
@@ -85,9 +107,7 @@ func (c *Config) SetDefault() {
 		}
 	}
 
-	if c.Slot.SlotActivityCheckerInterval == 0 {
-		c.Slot.SlotActivityCheckerInterval = 1000
-	}
+	c.Slot.SlotActivityCheckerInterval = normalizeMillisecondsDuration(c.Slot.SlotActivityCheckerInterval, time.Second)
 
 	if c.Slot.ProtoVersion == 0 {
 		c.Slot.ProtoVersion = 2
@@ -250,7 +270,23 @@ func (c *Config) Print() {
 	cfg := *c
 	cfg.Password = "*******"
 	b, _ := json.Marshal(cfg)
-	fmt.Println("used config: " + string(b))
+	logger.Info("used config", "config", string(b))
+}
+
+func normalizeMillisecondsDuration(value, defaultValue time.Duration) time.Duration {
+	if value == 0 {
+		return defaultValue
+	}
+
+	// Backward compatibility: earlier configs commonly used bare integers as
+	// milliseconds because the slot package multiplied this value by time.Millisecond.
+	// Duration strings such as "3s" are already parsed as durations and must not be
+	// multiplied again.
+	if value > 0 && value < time.Millisecond {
+		return value * time.Millisecond
+	}
+
+	return value
 }
 
 func isEmpty(s string) bool {

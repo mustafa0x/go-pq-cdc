@@ -77,9 +77,8 @@ func NewConnector(ctx context.Context, cfg config.Config, listenerFunc replicati
 	if err := cfg.Validate(); err != nil {
 		return nil, errors.Wrap(err, "config validation")
 	}
-	cfg.Print()
-
 	logger.InitLogger(cfg.Logger.Logger)
+	cfg.Print()
 
 	// Snapshot-only mode: minimal setup without CDC components
 	if cfg.IsSnapshotOnlyMode() {
