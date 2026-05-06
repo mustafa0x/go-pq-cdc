@@ -645,21 +645,22 @@ func (s *stream) fetchSnapshotLSN(ctx context.Context) (pq.LSN, error) {
 }
 
 func SendStandbyStatusUpdate(_ context.Context, conn pq.Connection, walReceivedPosition, walFlushedPosition uint64) error {
-	data := make([]byte, 0, 34)
-	data = append(data, StandbyStatusUpdateByteID)
-	data = AppendUint64(data, walReceivedPosition)
-	data = AppendUint64(data, walFlushedPosition)
-	data = AppendUint64(data, walFlushedPosition)
-	data = AppendUint64(data, timeToPgTime(time.Now()))
-	data = append(data, 0)
+	const (
+		copyDataHeaderLen          = 5
+		standbyStatusUpdateDataLen = 34
+	)
 
-	cd := &pgproto3.CopyData{Data: data}
-	buf, err := cd.Encode(nil)
-	if err != nil {
-		return err
-	}
+	var buf [copyDataHeaderLen + standbyStatusUpdateDataLen]byte
+	buf[0] = 'd'
+	binary.BigEndian.PutUint32(buf[1:5], uint32(len(buf)-1))
+	data := buf[copyDataHeaderLen:]
+	data[0] = StandbyStatusUpdateByteID
+	binary.BigEndian.PutUint64(data[1:9], walReceivedPosition)
+	binary.BigEndian.PutUint64(data[9:17], walFlushedPosition)
+	binary.BigEndian.PutUint64(data[17:25], walFlushedPosition)
+	binary.BigEndian.PutUint64(data[25:33], timeToPgTime(time.Now()))
 
-	return conn.Frontend().SendUnbufferedEncodedCopyData(buf)
+	return conn.Frontend().SendUnbufferedEncodedCopyData(buf[:])
 }
 
 func AppendUint64(buf []byte, n uint64) []byte {
