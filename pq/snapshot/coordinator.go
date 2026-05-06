@@ -577,7 +577,7 @@ func (s *Snapshotter) buildOffsetQuery(chunk *Chunk, orderByClause string, query
 // getOrderByClause returns the ORDER BY clause for a table
 func (s *Snapshotter) getOrderByClause(ctx context.Context, conn pq.Connection, table publication.Table) (string, []string, error) {
 	if entry, ok := s.loadOrderByCache(table); ok {
-		return entry.clause, cloneStringSlice(entry.columns), nil
+		return entry.clause, entry.columns, nil
 	}
 
 	columns, err := s.getPrimaryKeyColumnsDetailed(ctx, conn, table)
@@ -613,10 +613,7 @@ func (s *Snapshotter) loadOrderByCache(table publication.Table) (orderByCacheEnt
 		return orderByCacheEntry{}, false
 	}
 
-	return orderByCacheEntry{
-		clause:  entry.clause,
-		columns: cloneStringSlice(entry.columns),
-	}, true
+	return entry, true
 }
 
 func (s *Snapshotter) storeOrderByCache(table publication.Table, clause string, columns []string) {
@@ -625,22 +622,13 @@ func (s *Snapshotter) storeOrderByCache(table publication.Table, clause string, 
 	s.orderByMu.Lock()
 	s.orderByCache[key] = orderByCacheEntry{
 		clause:  clause,
-		columns: cloneStringSlice(columns),
+		columns: columns,
 	}
 	s.orderByMu.Unlock()
 }
 
 func (s *Snapshotter) orderByCacheKey(table publication.Table) string {
 	return fmt.Sprintf("%s.%s", table.Schema, table.Name)
-}
-
-func cloneStringSlice(in []string) []string {
-	if len(in) == 0 {
-		return nil
-	}
-	out := make([]string, len(in))
-	copy(out, in)
-	return out
 }
 
 // createTableChunksWithConn divides a table into chunks using the specified connection.
