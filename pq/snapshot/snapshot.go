@@ -161,15 +161,25 @@ func (s *Snapshotter) finalizeSnapshot(ctx context.Context, slotName string, job
 		return err
 	}
 
-	// Close all connections now that snapshot is complete
-	s.closeAllConnections(ctx, true)
+	shouldEmitEnd, err := s.markSnapshotEndEmitted(ctx, slotName)
+	if err != nil {
+		return errors.Wrap(err, "mark snapshot end emitted")
+	}
+	defer s.closeAllConnections(ctx, true)
+	if !shouldEmitEnd {
+		return nil
+	}
 
-	// Send END marker
-	return handler(&format.Snapshot{
+	// Send END marker once per snapshot job. Multiple workers may reach
+	// finalization concurrently, so marker emission is gated by metadata.
+	if err := handler(&format.Snapshot{
 		EventType:  format.SnapshotEventTypeEnd,
 		ServerTime: time.Now().UTC(),
 		LSN:        job.SnapshotLSN,
-	})
+	}); err != nil {
+		return errors.Wrap(err, "handle snapshot end")
+	}
+	return nil
 }
 
 // closeAllConnections closes all snapshot connections
