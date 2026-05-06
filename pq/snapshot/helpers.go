@@ -79,12 +79,20 @@ func (s *Snapshotter) retryDBOperation(ctx context.Context, operation func() err
 
 // getSnapshotColumns returns the list of columns for a given table from the publication configuration
 func (s *Snapshotter) getSnapshotColumns(schema, name string) []string {
+	if columns, ok := s.tableColumns[snapshotTableKey(schema, name)]; ok {
+		return columns
+	}
+
 	for _, t := range s.tables {
 		if t.Schema == schema && t.Name == name {
 			return t.Columns
 		}
 	}
 	return nil
+}
+
+func snapshotTableKey(schema, name string) string {
+	return schema + "\x00" + name
 }
 
 // isTransientError checks if an error is transient and should be retried

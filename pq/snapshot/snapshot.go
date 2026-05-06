@@ -37,6 +37,7 @@ type Snapshotter struct {
 	decoderCache       *DecoderCache
 	connectionPool     *ConnectionPool
 	orderByCache       map[string]orderByCacheEntry
+	tableColumns       map[string][]string
 	keepaliveDone      chan struct{}
 	dsn                string
 	cachedSnapshotID   string
@@ -71,6 +72,10 @@ func New(ctx context.Context, snapshotConfig config.SnapshotConfig, tables publi
 
 	// Create decoder cache for efficient type decoding
 	decoderCache := NewDecoderCache()
+	tableColumns := make(map[string][]string, len(tables))
+	for _, table := range tables {
+		tableColumns[snapshotTableKey(table.Schema, table.Name)] = table.Columns
+	}
 
 	return &Snapshotter{
 		dsn:             dsn,
@@ -83,6 +88,7 @@ func New(ctx context.Context, snapshotConfig config.SnapshotConfig, tables publi
 		typeMap:         pgtype.NewMap(),
 		metric:          m,
 		orderByCache:    make(map[string]orderByCacheEntry),
+		tableColumns:    tableColumns,
 	}, nil
 }
 
