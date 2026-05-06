@@ -7,9 +7,9 @@ import (
 	"strings"
 
 	"github.com/Trendyol/go-pq-cdc/logger"
+	"github.com/Trendyol/go-pq-cdc/pq"
 	"github.com/go-playground/errors"
 	"github.com/jackc/pgx/v5/pgconn"
-	"github.com/lib/pq"
 )
 
 const (
@@ -71,7 +71,7 @@ func (c *Publication) warnNothingReplicaIdentityWithUpdateDelete() {
 }
 
 func (c *Publication) AlterTableReplicaIdentity(ctx context.Context, t Table) error {
-	tableName := fmt.Sprintf("%s.%s", pq.QuoteIdentifier(t.Schema), pq.QuoteIdentifier(t.Name))
+	tableName := pq.QuoteQualifiedName(t.Schema, t.Name)
 	query := fmt.Sprintf("ALTER TABLE %s REPLICA IDENTITY %s;", tableName, t.ReplicaIdentity)
 	if t.ReplicaIdentity == ReplicaIdentityUsingIndex {
 		query = fmt.Sprintf("ALTER TABLE %s REPLICA IDENTITY USING INDEX %s;", tableName, pq.QuoteIdentifier(t.ReplicaIdentityIndex))

@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/lib/pq"
+	"github.com/Trendyol/go-pq-cdc/pq"
 )
 
 type Config struct {
@@ -47,16 +47,24 @@ func (c Config) createQuery() string {
 		}
 
 		if len(table.Columns) > 0 {
-			quotedTables[i] = fmt.Sprintf("%s.%s(%s)", pq.QuoteIdentifier(table.Schema), pq.QuoteIdentifier(table.Name), strings.Join(table.Columns, ", "))
+			quotedTables[i] = fmt.Sprintf("%s(%s)", pq.QuoteQualifiedName(table.Schema, table.Name), quoteColumnList(table.Columns))
 		} else {
-			quotedTables[i] = fmt.Sprintf("%s.%s", pq.QuoteIdentifier(table.Schema), pq.QuoteIdentifier(table.Name))
+			quotedTables[i] = pq.QuoteQualifiedName(table.Schema, table.Name)
 		}
 	}
 	sqlStatement += " FOR TABLE " + strings.Join(quotedTables, ", ")
 
-	sqlStatement += fmt.Sprintf(" WITH (publish = '%s', publish_via_partition_root = %t)", c.Operations.String(), hasPartitionedTable)
+	sqlStatement += fmt.Sprintf(" WITH (publish = %s, publish_via_partition_root = %t)", pq.QuoteLiteral(c.Operations.String()), hasPartitionedTable)
 
 	return sqlStatement
+}
+
+func quoteColumnList(columns []string) string {
+	quoted := make([]string, len(columns))
+	for i, column := range columns {
+		quoted[i] = pq.QuoteIdentifier(column)
+	}
+	return strings.Join(quoted, ", ")
 }
 
 func (c Config) infoQuery() string {
@@ -70,14 +78,14 @@ func (c Config) infoQuery() string {
         p.pubdelete,
         p.pubtruncate
     FROM pg_publication p
-    WHERE p.pubname = '%s'
+    WHERE p.pubname = %s
 	),
 	expanded_tables AS (
 		SELECT
 			pubname,
 			array_agg(schemaname || '.' || tablename) AS tables
 		FROM pg_publication_tables
-		WHERE pubname = '%s'
+		WHERE pubname = %s
 		GROUP BY pubname
 	)
 	SELECT
@@ -89,6 +97,6 @@ func (c Config) infoQuery() string {
 		pd.pubtruncate,
 		COALESCE(et.tables, ARRAY[]::text[]) AS pubtables
 	FROM publication_details pd
-	LEFT JOIN expanded_tables et ON pd.pubname = et.pubname;`, c.Name, c.Name)
+	LEFT JOIN expanded_tables et ON pd.pubname = et.pubname;`, pq.QuoteLiteral(c.Name), pq.QuoteLiteral(c.Name))
 	return q
 }
