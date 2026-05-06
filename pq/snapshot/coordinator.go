@@ -262,6 +262,8 @@ func (s *Snapshotter) initTables(ctx context.Context) error {
 				snapshot_lsn TEXT NOT NULL,
 				started_at TIMESTAMP NOT NULL,
 				completed BOOLEAN DEFAULT FALSE,
+				begin_emitted BOOLEAN DEFAULT FALSE,
+				end_emitted BOOLEAN DEFAULT FALSE,
 				total_chunks INT NOT NULL DEFAULT 0,
 				completed_chunks INT NOT NULL DEFAULT 0
 			)
@@ -349,6 +351,9 @@ func (s *Snapshotter) initTables(ctx context.Context) error {
 func (s *Snapshotter) migrateSchema(ctx context.Context) {
 	// These ALTER statements are idempotent (IF NOT EXISTS) and safe to run on every startup
 	migrations := []string{
+		// Snapshot marker idempotency fields
+		"ALTER TABLE cdc_snapshot_job ADD COLUMN IF NOT EXISTS begin_emitted BOOLEAN DEFAULT FALSE",
+		"ALTER TABLE cdc_snapshot_job ADD COLUMN IF NOT EXISTS end_emitted BOOLEAN DEFAULT FALSE",
 		// CTID block partitioning fields
 		"ALTER TABLE cdc_snapshot_chunks ADD COLUMN IF NOT EXISTS block_start BIGINT",
 		"ALTER TABLE cdc_snapshot_chunks ADD COLUMN IF NOT EXISTS block_end BIGINT",

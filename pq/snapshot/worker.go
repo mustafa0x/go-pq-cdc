@@ -106,12 +106,22 @@ func (s *Snapshotter) executeWorker(ctx context.Context, slotName, instanceID st
 		s.metric.SetSnapshotDurationSeconds(time.Since(startTime).Seconds())
 	}()
 
-	// Send BEGIN marker
-	_ = handler(&format.Snapshot{
-		EventType:  format.SnapshotEventTypeBegin,
-		ServerTime: time.Now().UTC(),
-		LSN:        job.SnapshotLSN,
-	})
+	shouldEmitBegin, err := s.markSnapshotBeginEmitted(ctx, slotName)
+	if err != nil {
+		return errors.Wrap(err, "mark snapshot begin emitted")
+	}
+
+	if shouldEmitBegin {
+		// Send BEGIN marker once per snapshot job. Multiple workers may enter this
+		// path concurrently, so marker emission is gated by metadata.
+		if err := handler(&format.Snapshot{
+			EventType:  format.SnapshotEventTypeBegin,
+			ServerTime: time.Now().UTC(),
+			LSN:        job.SnapshotLSN,
+		}); err != nil {
+			return errors.Wrap(err, "handle snapshot begin")
+		}
+	}
 
 	// Process chunks (each chunk will have its own transaction)
 	if err := s.workerProcess(ctx, slotName, instanceID, job, handler); err != nil {
@@ -395,6 +405,39 @@ func (s *Snapshotter) heartbeatWorker(ctx context.Context, currentChunk <-chan i
 			}
 		}
 	}
+}
+
+func (s *Snapshotter) markSnapshotBeginEmitted(ctx context.Context, slotName string) (bool, error) {
+	return s.markSnapshotMarkerEmitted(ctx, slotName, "begin_emitted")
+}
+
+func (s *Snapshotter) markSnapshotEndEmitted(ctx context.Context, slotName string) (bool, error) {
+	return s.markSnapshotMarkerEmitted(ctx, slotName, "end_emitted")
+}
+
+func (s *Snapshotter) markSnapshotMarkerEmitted(ctx context.Context, slotName, column string) (bool, error) {
+	if column != "begin_emitted" && column != "end_emitted" {
+		return false, errors.New("invalid snapshot marker column")
+	}
+
+	var emitted bool
+	err := s.retryDBOperation(ctx, func() error {
+		query := fmt.Sprintf(`
+			UPDATE %s
+			SET %s = true
+			WHERE slot_name = %s AND %s = false
+			RETURNING slot_name
+		`, jobTableName, column, pq.QuoteLiteral(slotName), column)
+
+		results, err := s.execQuery(ctx, s.metadataConn, query)
+		if err != nil {
+			return err
+		}
+
+		emitted = len(results) > 0 && len(results[0].Rows) > 0
+		return nil
+	})
+	return emitted, err
 }
 
 // markJobAsCompleted marks the job as completed (safe to call multiple times)
