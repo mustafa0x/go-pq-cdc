@@ -42,14 +42,22 @@ func NewServer(cfg config.Config, registry metric.Registry, slotInfoProvider Slo
 
 	mux.Handle("GET /metrics", promhttp.HandlerFor(registry.Prometheus(), promhttp.HandlerOpts{EnableOpenMetrics: true}))
 
-	mux.HandleFunc("GET /status", func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte("OK"))
-	})
+	mux.HandleFunc("GET /status", s.handleStatus)
 
 	mux.HandleFunc("GET /slot", s.handleSlotInfo)
 
 	if cfg.DebugMode {
-		mux.Handle("GET /pprof", pprof.Handler("go-pq-cdc"))
+		mux.HandleFunc("GET /debug/pprof", pprof.Index)
+		mux.HandleFunc("GET /debug/pprof/", pprof.Index)
+		mux.HandleFunc("GET /debug/pprof/cmdline", pprof.Cmdline)
+		mux.HandleFunc("GET /debug/pprof/profile", pprof.Profile)
+		mux.HandleFunc("GET /debug/pprof/symbol", pprof.Symbol)
+		mux.HandleFunc("GET /debug/pprof/trace", pprof.Trace)
+		mux.Handle("GET /debug/pprof/goroutine", pprof.Handler("goroutine"))
+		mux.Handle("GET /debug/pprof/heap", pprof.Handler("heap"))
+		mux.Handle("GET /debug/pprof/threadcreate", pprof.Handler("threadcreate"))
+		mux.Handle("GET /debug/pprof/block", pprof.Handler("block"))
+		mux.Handle("GET /debug/pprof/mutex", pprof.Handler("mutex"))
 	}
 
 	s.server = http.Server{
@@ -80,10 +88,30 @@ func (s *server) Shutdown() {
 		return
 	}
 	s.closed = true
-	err := s.server.Shutdown(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	err := s.server.Shutdown(ctx)
 	if err != nil {
 		logger.Error("error while api cannot be shutdown", "error", err)
-		panic(err)
+	}
+}
+
+func (s *server) handleStatus(w http.ResponseWriter, r *http.Request) {
+	status := map[string]any{"status": "ok"}
+
+	if s.slotInfoProvider != nil {
+		info, err := s.slotInfoProvider.Info(r.Context())
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusServiceUnavailable)
+			return
+		}
+		status["slot"] = info
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(status); err != nil {
+		logger.Error("failed to encode status response", "error", err)
 	}
 }
 
