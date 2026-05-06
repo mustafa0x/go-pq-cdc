@@ -5,7 +5,6 @@ import (
 	"encoding/binary"
 	goerrors "errors"
 	"fmt"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -60,10 +59,9 @@ type stream struct {
 	messageCH           chan *Message
 	listenerFunc        ListenerFunc
 	sinkEnd             chan struct{}
-	mu                  *sync.RWMutex
 	config              config.Config
-	lastXLogPos         pq.LSN
-	confirmedXLogPos    pq.LSN
+	lastXLogPos         atomic.Uint64
+	confirmedXLogPos    atomic.Uint64
 	snapshotLSN         pq.LSN
 	openFromSnapshotLSN bool
 	closed              atomic.Bool
@@ -78,12 +76,7 @@ func NewStream(dsn string, cfg config.Config, m metric.Metric, listenerFunc List
 		relation:     make(map[uint32]*format.Relation),
 		messageCH:    make(chan *Message, 1000),
 		listenerFunc: listenerFunc,
-		// lastXLogPos:0 is not magical, 0 means, create replication starts with confirmed_flush_lsn
-		// https://github.com/postgres/postgres/blob/master/src/include/access/xlogdefs.h#L28
-		// https://github.com/postgres/postgres/blob/master/src/backend/replication/logical/logical.c#L540
-		lastXLogPos: 0,
-		sinkEnd:     make(chan struct{}, 1),
-		mu:          &sync.RWMutex{},
+		sinkEnd:      make(chan struct{}, 1),
 	}
 }
 
@@ -129,7 +122,7 @@ func (s *stream) Open(ctx context.Context) error {
 func (s *stream) setup(ctx context.Context) error {
 	replication := New(s.conn)
 
-	replicationStartLsn := s.lastXLogPos
+	replicationStartLsn := s.LoadXLogPos()
 	if s.openFromSnapshotLSN {
 		snapshotLSN, err := s.fetchSnapshotLSN(ctx)
 		if err != nil {
@@ -537,33 +530,35 @@ func (s *stream) SetSnapshotLSN(lsn pq.LSN) {
 }
 
 func (s *stream) UpdateXLogPos(l pq.LSN) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if s.lastXLogPos < l {
-		s.lastXLogPos = l
+	for {
+		current := s.lastXLogPos.Load()
+		if current >= uint64(l) {
+			return
+		}
+		if s.lastXLogPos.CompareAndSwap(current, uint64(l)) {
+			return
+		}
 	}
 }
 
 func (s *stream) LoadXLogPos() pq.LSN {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.lastXLogPos
+	return pq.LSN(s.lastXLogPos.Load())
 }
 
 func (s *stream) UpdateConfirmedXLogPos(l pq.LSN) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if s.confirmedXLogPos < l {
-		s.confirmedXLogPos = l
+	for {
+		current := s.confirmedXLogPos.Load()
+		if current >= uint64(l) {
+			return
+		}
+		if s.confirmedXLogPos.CompareAndSwap(current, uint64(l)) {
+			return
+		}
 	}
 }
 
 func (s *stream) LoadConfirmedXLogPos() pq.LSN {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.confirmedXLogPos
+	return pq.LSN(s.confirmedXLogPos.Load())
 }
 
 func (s *stream) OpenFromSnapshotLSN() {
