@@ -50,7 +50,10 @@ type connector struct {
 	cfg                *config.Config
 	snapshotter        *snapshot.Snapshotter
 	listenerFunc       replication.ListenerFunc
-	once               sync.Once
+	serverOnce         sync.Once
+	readyOnce          sync.Once
+	closeOnce          sync.Once
+	stopCh             chan struct{}
 }
 
 func NewConnectorWithConfigFile(ctx context.Context, configFilePath string, listenerFunc replication.ListenerFunc) (Connector, error) {
@@ -155,7 +158,8 @@ func NewConnector(ctx context.Context, cfg config.Config, listenerFunc replicati
 		snapshotter:        snapshotter,
 		listenerFunc:       listenerFunc,
 		cancelCh:           make(chan os.Signal, 1),
-		readyCh:            make(chan struct{}, 1),
+		readyCh:            make(chan struct{}),
+		stopCh:             make(chan struct{}),
 	}, nil
 }
 
@@ -188,7 +192,8 @@ func newSnapshotOnlyConnector(ctx context.Context, cfg config.Config, listenerFu
 		snapshotter:        snapshotter,
 		listenerFunc:       listenerFunc,
 		cancelCh:           make(chan os.Signal, 1),
-		readyCh:            make(chan struct{}, 1),
+		readyCh:            make(chan struct{}),
+		stopCh:             make(chan struct{}),
 		// CDC components left nil: system, stream, slot
 	}, nil
 }
@@ -214,15 +219,21 @@ func initializeSnapshot(ctx context.Context, cfg config.Config, tables publicati
 }
 
 func (c *connector) Start(ctx context.Context) {
-	c.once.Do(func() {
+	c.serverOnce.Do(func() {
 		go c.server.Listen()
 	})
+
+	if err := c.errIfStopped(ctx); err != nil {
+		logger.Debug("connector start canceled before startup", "error", err)
+		return
+	}
 
 	// Snapshot-only mode: execute snapshot and exit
 	if c.cfg.IsSnapshotOnlyMode() {
 		// Check if snapshot already completed (resume capability)
 		if !c.shouldTakeSnapshotOnly(ctx) {
 			logger.Info("snapshot-only already completed, exiting")
+			c.signalReady()
 			return
 		}
 
@@ -231,6 +242,7 @@ func (c *connector) Start(ctx context.Context) {
 			return
 		}
 		logger.Info("snapshot-only completed successfully, exiting")
+		c.signalReady()
 		return
 	}
 
@@ -252,26 +264,33 @@ func (c *connector) Start(ctx context.Context) {
 		logger.Info("slot info", "info", slotInfo)
 	}
 
+	if err := c.errIfStopped(ctx); err != nil {
+		logger.Debug("connector start canceled before slot connect", "error", err)
+		return
+	}
+
 	if err := c.slot.Connect(ctx); err != nil {
 		logger.Error("slot connection failed", "error", err)
 		return
 	}
 
 	// Normal CDC flow (unchanged for backward compatibility)
-	c.CaptureSlot(ctx)
+	if err := c.CaptureSlot(ctx); err != nil {
+		logger.Error("capture slot failed", "error", err)
+		return
+	}
+
+	if err := c.errIfStopped(ctx); err != nil {
+		logger.Debug("connector start canceled before stream connect", "error", err)
+		return
+	}
 
 	if err := c.stream.Connect(ctx); err != nil {
 		logger.Error("stream connection failed", "error", err)
 		return
 	}
 
-	err := c.stream.Open(ctx)
-	if err != nil {
-		if goerrors.Is(err, replication.ErrorSlotInUse) {
-			logger.Info("capture failed")
-			c.Start(ctx)
-			return
-		}
+	if err := c.openStream(ctx); err != nil {
 		logger.Error("postgres stream open", "error", err)
 		return
 	}
@@ -289,11 +308,57 @@ func (c *connector) Start(ctx context.Context) {
 	}
 
 	signal.Notify(c.cancelCh, syscall.SIGTERM, syscall.SIGINT, syscall.SIGABRT, syscall.SIGQUIT)
+	defer signal.Stop(c.cancelCh)
 
-	c.readyCh <- struct{}{}
+	c.signalReady()
 
-	<-c.cancelCh
-	logger.Debug("cancel channel triggered")
+	select {
+	case sig := <-c.cancelCh:
+		logger.Debug("cancel channel triggered", "signal", sig)
+	case <-ctx.Done():
+		logger.Debug("context canceled", "error", ctx.Err())
+	case <-c.stopCh:
+		logger.Debug("connector close requested")
+	}
+
+	c.Close()
+}
+
+func (c *connector) openStream(ctx context.Context) error {
+	for {
+		err := c.stream.Open(ctx)
+		if err == nil {
+			return nil
+		}
+		if !goerrors.Is(err, replication.ErrorSlotInUse) {
+			return err
+		}
+
+		logger.Info("replication slot is active; waiting before retrying stream open")
+		if err := c.waitWithContext(ctx, time.Second); err != nil {
+			return err
+		}
+		if err := c.errIfStopped(ctx); err != nil {
+			return err
+		}
+	}
+}
+
+func (c *connector) errIfStopped(ctx context.Context) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-c.stopCh:
+		return context.Canceled
+	default:
+		return nil
+	}
+}
+
+func (c *connector) signalReady() {
+	c.readyOnce.Do(func() {
+		close(c.readyCh)
+	})
 }
 
 func (c *connector) shouldTakeSnapshot(ctx context.Context) bool {
@@ -332,7 +397,11 @@ func (c *connector) shouldTakeSnapshot(ctx context.Context) bool {
 // 3. Execute: Collect snapshot data
 // This ensures no WAL changes are lost during snapshot execution
 func (c *connector) prepareSnapshotAndSlot(ctx context.Context) error {
-	return c.retryOperation("snapshot", 3, func(_ int) error {
+	return c.retryOperation(ctx, "snapshot", 3, func(_ int) error {
+		if err := c.errIfStopped(ctx); err != nil {
+			return err
+		}
+
 		// Phase 1: Create replication slot immediately (CRITICAL - preserves WAL)
 		slotInfo, err := c.slot.Create(ctx)
 		if err != nil {
@@ -498,10 +567,15 @@ func (c *connector) logRetryAttempt(attempt, maxRetries int, delay time.Duration
 
 // waitWithContext waits for duration or context cancellation
 func (c *connector) waitWithContext(ctx context.Context, duration time.Duration) error {
+	timer := time.NewTimer(duration)
+	defer timer.Stop()
+
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
-	case <-time.After(duration):
+	case <-c.stopCh:
+		return context.Canceled
+	case <-timer.C:
 		return nil
 	}
 }
@@ -515,12 +589,16 @@ func (c *connector) calculateNextDelay(currentDelay, maxDelay time.Duration, mul
 	return nextDelay
 }
 
-// retryOperation executes an operation with retry logic
-func (c *connector) retryOperation(operationName string, maxRetries int, operation func(attempt int) error) error {
+// retryOperation executes an operation with retry logic.
+func (c *connector) retryOperation(ctx context.Context, operationName string, maxRetries int, operation func(attempt int) error) error {
 	var lastErr error
 	retryDelay := 5 * time.Second
 
 	for attempt := 1; attempt <= maxRetries; attempt++ {
+		if err := c.errIfStopped(ctx); err != nil {
+			return err
+		}
+
 		if attempt > 1 {
 			logger.Info("retrying operation", "operation", operationName, "attempt", attempt, "maxRetries", maxRetries)
 		}
@@ -531,7 +609,9 @@ func (c *connector) retryOperation(operationName string, maxRetries int, operati
 
 			if attempt < maxRetries {
 				logger.Info("waiting before retry", "retryDelay", retryDelay.String())
-				time.Sleep(retryDelay)
+				if waitErr := c.waitWithContext(ctx, retryDelay); waitErr != nil {
+					return waitErr
+				}
 			}
 			continue
 		}
@@ -556,48 +636,47 @@ func (c *connector) WaitUntilReady(ctx context.Context) error {
 	select {
 	case <-c.readyCh:
 		return nil
+	case <-c.stopCh:
+		return context.Canceled
 	case <-ctx.Done():
 		return ctx.Err()
 	}
 }
 
 func (c *connector) Close() {
-	// Create a context with timeout for graceful cleanup
-	// 30 seconds should be sufficient for closing connections and cleanup operations
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
+	c.closeOnce.Do(func() {
+		// Create a context with timeout for graceful cleanup.
+		// 30 seconds should be sufficient for closing connections and cleanup operations.
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
 
-	logger.Debug("[connector] closing connector")
+		logger.Debug("[connector] closing connector")
 
-	// Close signal channels
-	if !isClosed(c.cancelCh) {
-		close(c.cancelCh)
-	}
-	if !isClosed(c.readyCh) {
-		close(c.readyCh)
-	}
+		close(c.stopCh)
+		signal.Stop(c.cancelCh)
 
-	// Close snapshotter connections if still open (fallback for crash/error scenarios)
-	// Normal flow: connections are already closed in finalizeSnapshot() when snapshot completes
-	if c.snapshotter != nil {
-		c.snapshotter.Close(ctx)
-	}
+		// Close snapshotter connections if still open (fallback for crash/error scenarios)
+		// Normal flow: connections are already closed in finalizeSnapshot() when snapshot completes
+		if c.snapshotter != nil {
+			c.snapshotter.Close(ctx)
+		}
 
-	// Close replication slot and stream (nil in snapshot_only mode)
-	if c.slot != nil {
-		c.slot.Close(ctx)
-	}
-	if c.heartbeat != nil {
-		c.heartbeat.Close(ctx)
-	}
-	if c.stream != nil {
-		c.stream.Close(ctx)
-	}
+		// Close replication slot and stream (nil in snapshot_only mode)
+		if c.slot != nil {
+			c.slot.Close(ctx)
+		}
+		if c.heartbeat != nil {
+			c.heartbeat.Close(ctx)
+		}
+		if c.stream != nil {
+			c.stream.Close(ctx)
+		}
 
-	// Shutdown HTTP server
-	c.server.Shutdown()
+		// Shutdown HTTP server
+		c.server.Shutdown()
 
-	logger.Info("[connector] connector closed successfully")
+		logger.Info("[connector] connector closed successfully")
+	})
 }
 
 func (c *connector) GetConfig() *config.Config {
@@ -608,13 +687,24 @@ func (c *connector) SetMetricCollectors(metricCollectors ...prometheus.Collector
 	c.prometheusRegistry.AddMetricCollectors(metricCollectors...)
 }
 
-func (c *connector) CaptureSlot(ctx context.Context) {
+func (c *connector) CaptureSlot(ctx context.Context) error {
 	logger.Info("slot capturing...")
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
-	for range ticker.C {
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-c.stopCh:
+			return context.Canceled
+		case <-ticker.C:
+		}
+
 		info, err := c.slot.Info(ctx)
 		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
 			logger.Warn("slot info failed on capture slot", "error", err)
 			continue
 		}
@@ -624,16 +714,6 @@ func (c *connector) CaptureSlot(ctx context.Context) {
 		}
 
 		logger.Debug("capture slot", "slotInfo", info)
-		break
+		return nil
 	}
-}
-
-func isClosed[T any](ch <-chan T) bool {
-	select {
-	case <-ch:
-		return true
-	default:
-	}
-
-	return false
 }
