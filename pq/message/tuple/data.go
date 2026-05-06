@@ -22,7 +22,7 @@ type Data struct {
 	ColumnNumber uint16
 }
 
-type DataColumns []*DataColumn
+type DataColumns []DataColumn
 
 type DataColumn struct {
 	Data     []byte
@@ -53,8 +53,9 @@ func (d *Data) Decode(data []byte, skipByteLength int) {
 	d.ColumnNumber = binary.BigEndian.Uint16(data[skipByteLength:])
 	skipByteLength += 2
 
+	d.Columns = make(DataColumns, 0, d.ColumnNumber)
 	for range d.ColumnNumber {
-		col := new(DataColumn)
+		var col DataColumn
 		col.DataType = data[skipByteLength]
 		skipByteLength++
 
