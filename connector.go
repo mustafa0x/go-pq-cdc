@@ -4,7 +4,6 @@ import (
 	"context"
 	goerrors "errors"
 	"fmt"
-	"log"
 	"os"
 	"os/signal"
 	"strings"
@@ -31,7 +30,7 @@ import (
 )
 
 type Connector interface {
-	Start(ctx context.Context)
+	Start(ctx context.Context) error
 	WaitUntilReady(ctx context.Context) error
 	Close()
 	GetConfig() *config.Config
@@ -218,14 +217,14 @@ func initializeSnapshot(ctx context.Context, cfg config.Config, tables publicati
 	return snapshot.New(ctx, cfg.Snapshot, tables, cfg.DSN(), m)
 }
 
-func (c *connector) Start(ctx context.Context) {
+func (c *connector) Start(ctx context.Context) error {
 	c.serverOnce.Do(func() {
 		go c.server.Listen()
 	})
 
 	if err := c.errIfStopped(ctx); err != nil {
 		logger.Debug("connector start canceled before startup", "error", err)
-		return
+		return err
 	}
 
 	// Snapshot-only mode: execute snapshot and exit
@@ -234,16 +233,16 @@ func (c *connector) Start(ctx context.Context) {
 		if !c.shouldTakeSnapshotOnly(ctx) {
 			logger.Info("snapshot-only already completed, exiting")
 			c.signalReady()
-			return
+			return nil
 		}
 
 		if err := c.executeSnapshotOnly(ctx); err != nil {
 			logger.Error("snapshot-only execution failed", "error", err)
-			return
+			return err
 		}
 		logger.Info("snapshot-only completed successfully, exiting")
 		c.signalReady()
-		return
+		return nil
 	}
 
 	// Snapshot Pre-phase (optional): Prepare → CreateSlot → Execute
@@ -251,7 +250,7 @@ func (c *connector) Start(ctx context.Context) {
 	if c.cfg.Snapshot.Enabled && c.shouldTakeSnapshot(ctx) {
 		if err := c.prepareSnapshotAndSlot(ctx); err != nil {
 			logger.Error("snapshot preparation failed", "error", err)
-			return
+			return err
 		}
 	} else {
 		// No snapshot: Create slot normally before starting CDC
@@ -259,40 +258,40 @@ func (c *connector) Start(ctx context.Context) {
 		slotInfo, err := c.slot.Create(ctx)
 		if err != nil {
 			logger.Error("slot creation failed", "error", err)
-			return
+			return err
 		}
 		logger.Info("slot info", "info", slotInfo)
 	}
 
 	if err := c.errIfStopped(ctx); err != nil {
 		logger.Debug("connector start canceled before slot connect", "error", err)
-		return
+		return err
 	}
 
 	if err := c.slot.Connect(ctx); err != nil {
 		logger.Error("slot connection failed", "error", err)
-		return
+		return err
 	}
 
 	// Normal CDC flow (unchanged for backward compatibility)
 	if err := c.CaptureSlot(ctx); err != nil {
 		logger.Error("capture slot failed", "error", err)
-		return
+		return err
 	}
 
 	if err := c.errIfStopped(ctx); err != nil {
 		logger.Debug("connector start canceled before stream connect", "error", err)
-		return
+		return err
 	}
 
 	if err := c.stream.Connect(ctx); err != nil {
 		logger.Error("stream connection failed", "error", err)
-		return
+		return err
 	}
 
 	if err := c.openStream(ctx); err != nil {
 		logger.Error("postgres stream open", "error", err)
-		return
+		return err
 	}
 
 	logger.Info("slot captured")
@@ -312,16 +311,19 @@ func (c *connector) Start(ctx context.Context) {
 
 	c.signalReady()
 
+	var stopErr error
 	select {
 	case sig := <-c.cancelCh:
 		logger.Debug("cancel channel triggered", "signal", sig)
 	case <-ctx.Done():
-		logger.Debug("context canceled", "error", ctx.Err())
+		stopErr = ctx.Err()
+		logger.Debug("context canceled", "error", stopErr)
 	case <-c.stopCh:
 		logger.Debug("connector close requested")
 	}
 
 	c.Close()
+	return stopErr
 }
 
 func (c *connector) openStream(ctx context.Context) error {
@@ -421,7 +423,7 @@ func (c *connector) prepareSnapshotAndSlot(ctx context.Context) error {
 		if err := c.executeSnapshotWithRetry(ctx); err != nil {
 			// Non-recoverable error
 			if c.isSnapshotInvalidationError(err) {
-				log.Fatal(err)
+				return errors.Wrap(err, "snapshot invalidated")
 			}
 			return errors.Wrap(err, "execute snapshot")
 		}
