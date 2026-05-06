@@ -148,7 +148,13 @@ func (s *Slot) infoLocked(ctx context.Context) (*Info, error) {
 }
 
 func (s *Slot) Metrics(ctx context.Context) {
-	for range s.ticker.C {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-s.ticker.C:
+		}
+
 		if s.closed.Load() {
 			return
 		}
