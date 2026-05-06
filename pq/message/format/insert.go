@@ -53,18 +53,17 @@ func (m *Insert) decode(data []byte, streamedTransaction bool) error {
 	skipByte := 1
 
 	if streamedTransaction {
-		if len(data) < 13 {
-			return errors.Newf("streamed transaction insert message length must be at least 13 byte, but got %d", len(data))
+		if err := requireMessageBytes(data, skipByte, 4, "streamed transaction insert xid"); err != nil {
+			return err
 		}
 
 		m.XID = binary.BigEndian.Uint32(data[skipByte:])
 		skipByte += 4
 	}
 
-	if len(data) < 9 {
-		return errors.Newf("insert message length must be at least 9 byte, but got %d", len(data))
+	if err := requireMessageBytes(data, skipByte, 4, "insert relation oid"); err != nil {
+		return err
 	}
-
 	m.OID = binary.BigEndian.Uint32(data[skipByte:])
 	skipByte += 4
 

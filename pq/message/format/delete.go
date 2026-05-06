@@ -49,18 +49,17 @@ func (m *Delete) decode(data []byte, streamedTransaction bool) error {
 	skipByte := 1
 
 	if streamedTransaction {
-		if len(data) < 11 {
-			return errors.Newf("streamed transaction delete message length must be at least 11 byte, but got %d", len(data))
+		if err := requireMessageBytes(data, skipByte, 4, "streamed transaction delete xid"); err != nil {
+			return err
 		}
 
 		m.XID = binary.BigEndian.Uint32(data[skipByte:])
 		skipByte += 4
 	}
 
-	if len(data) < 7 {
-		return errors.Newf("delete message length must be at least 7 byte, but got %d", len(data))
+	if err := requireMessageBytes(data, skipByte, 5, "delete relation oid and tuple type"); err != nil {
+		return err
 	}
-
 	m.OID = binary.BigEndian.Uint32(data[skipByte:])
 	skipByte += 4
 

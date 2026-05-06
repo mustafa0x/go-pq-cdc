@@ -59,6 +59,51 @@ func TestNewData(t *testing.T) {
 	})
 }
 
+func TestNewDataBoundsChecks(t *testing.T) {
+	t.Run("returns error when tuple type byte is missing", func(t *testing.T) {
+		d, err := NewData(nil, 'D', 0)
+
+		require.Error(t, err)
+		assert.Nil(t, d)
+		assert.Contains(t, err.Error(), "tuple data type byte missing")
+	})
+
+	t.Run("returns error when column count is truncated", func(t *testing.T) {
+		d, err := NewData([]byte{'D', 0}, 'D', 0)
+
+		require.Error(t, err)
+		assert.Nil(t, d)
+		assert.Contains(t, err.Error(), "tuple column count")
+	})
+
+	t.Run("returns error when text column length is truncated", func(t *testing.T) {
+		data := []byte{'D', 0, 1, DataTypeText, 0, 0, 0}
+		d, err := NewData(data, 'D', 0)
+
+		require.Error(t, err)
+		assert.Nil(t, d)
+		assert.Contains(t, err.Error(), "tuple column length")
+	})
+
+	t.Run("returns error when text column data is truncated", func(t *testing.T) {
+		data := []byte{'D', 0, 1, DataTypeText, 0, 0, 0, 5, 'v'}
+		d, err := NewData(data, 'D', 0)
+
+		require.Error(t, err)
+		assert.Nil(t, d)
+		assert.Contains(t, err.Error(), "exceeds remaining message length")
+	})
+
+	t.Run("returns error for unsupported tuple column data type", func(t *testing.T) {
+		data := []byte{'D', 0, 1, 'x'}
+		d, err := NewData(data, 'D', 0)
+
+		require.Error(t, err)
+		assert.Nil(t, d)
+		assert.Contains(t, err.Error(), "unsupported tuple column data type")
+	})
+}
+
 func TestData_DecodeWithColumn(t *testing.T) {
 	tupleDataType := uint8('D')
 	buf := []byte{}
@@ -79,7 +124,8 @@ func TestData_DecodeWithColumn(t *testing.T) {
 	// Col 2: Null 'n'
 	buf = append(buf, DataTypeNull)
 
-	d, _ := NewData(buf, tupleDataType, 0)
+	d, err := NewData(buf, tupleDataType, 0)
+	require.NoError(t, err)
 
 	t.Run("should decode columns correctly", func(t *testing.T) {
 		relationColumns := []RelationColumn{
@@ -103,5 +149,13 @@ func TestData_DecodeWithColumn(t *testing.T) {
 		decoded, err := d.DecodeWithColumn(relationColumns)
 		require.NoError(t, err)
 		assert.Equal(t, "123", decoded["unknown_col"]) // Fallback to string
+	})
+
+	t.Run("returns error when relation has fewer columns than tuple", func(t *testing.T) {
+		decoded, err := d.DecodeWithColumn([]RelationColumn{{Name: "id", DataType: pgtype.Int4OID}})
+
+		require.Error(t, err)
+		assert.Nil(t, decoded)
+		assert.Contains(t, err.Error(), "exceeds relation column count")
 	})
 }

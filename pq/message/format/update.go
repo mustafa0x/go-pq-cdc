@@ -64,18 +64,17 @@ func (m *Update) decode(data []byte, streamedTransaction bool) error {
 	skipByte := 1
 
 	if streamedTransaction {
-		if len(data) < 11 {
-			return errors.Newf("streamed transaction update message length must be at least 11 byte, but got %d", len(data))
+		if err := requireMessageBytes(data, skipByte, 4, "streamed transaction update xid"); err != nil {
+			return err
 		}
 
 		m.XID = binary.BigEndian.Uint32(data[skipByte:])
 		skipByte += 4
 	}
 
-	if len(data) < 7 {
-		return errors.Newf("update message length must be at least 7 byte, but got %d", len(data))
+	if err := requireMessageBytes(data, skipByte, 5, "update relation oid and tuple type"); err != nil {
+		return err
 	}
-
 	m.OID = binary.BigEndian.Uint32(data[skipByte:])
 	skipByte += 4
 
@@ -101,6 +100,9 @@ func (m *Update) decode(data []byte, streamedTransaction bool) error {
 			for i, col := range m.NewTupleData.Columns {
 				// because toasted columns not sent until the toasted column updated
 				if col.DataType == tuple.DataTypeToast {
+					if i >= len(m.OldTupleData.Columns) {
+						return errors.Newf("update message toast column %d exceeds old tuple column count %d", i, len(m.OldTupleData.Columns))
+					}
 					m.NewTupleData.Columns[i] = m.OldTupleData.Columns[i]
 				}
 			}

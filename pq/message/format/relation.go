@@ -31,18 +31,17 @@ func (m *Relation) decode(data []byte, streamedTransaction bool) error {
 	skipByte := 1
 
 	if streamedTransaction {
-		if len(data) < 12 {
-			return errors.Newf("streamed transaction relation message length must be at least 12 byte, but got %d", len(data))
+		if err := requireMessageBytes(data, skipByte, 4, "streamed transaction relation xid"); err != nil {
+			return err
 		}
 
 		m.XID = binary.BigEndian.Uint32(data[skipByte:])
 		skipByte += 4
 	}
 
-	if len(data) < 8 {
-		return errors.Newf("relation message length must be at least 8 byte, but got %d", len(data))
+	if err := requireMessageBytes(data, skipByte, 4, "relation oid"); err != nil {
+		return err
 	}
-
 	m.OID = binary.BigEndian.Uint32(data[skipByte:])
 	skipByte += 4
 
@@ -55,10 +54,13 @@ func (m *Relation) decode(data []byte, streamedTransaction bool) error {
 
 	m.Name, usedByteCount = decodeString(data[skipByte:])
 	if usedByteCount < 0 {
-		return errors.New("relation message namespace decode error")
+		return errors.New("relation message name decode error")
 	}
 	skipByte += usedByteCount
 
+	if err := requireMessageBytes(data, skipByte, 3, "relation replica identity and column count"); err != nil {
+		return err
+	}
 	m.ReplicaID = data[skipByte]
 	skipByte++
 
@@ -67,6 +69,10 @@ func (m *Relation) decode(data []byte, streamedTransaction bool) error {
 
 	m.Columns = make([]tuple.RelationColumn, m.ColumnNumbers)
 	for i := range m.Columns {
+		if err := requireMessageBytes(data, skipByte, 1, "relation column flags"); err != nil {
+			return errors.Wrapf(err, "column %d", i)
+		}
+
 		col := tuple.RelationColumn{}
 		col.Flags = data[skipByte]
 		skipByte++
@@ -77,6 +83,9 @@ func (m *Relation) decode(data []byte, streamedTransaction bool) error {
 		}
 		skipByte += usedByteCount
 
+		if err := requireMessageBytes(data, skipByte, 8, "relation column type metadata"); err != nil {
+			return errors.Wrapf(err, "column %d", i)
+		}
 		col.DataType = binary.BigEndian.Uint32(data[skipByte:])
 		skipByte += 4
 
@@ -96,4 +105,17 @@ func decodeString(data []byte) (string, int) {
 	}
 
 	return string(data[:end]), end + 1
+}
+
+func requireMessageBytes(data []byte, offset, size int, field string) error {
+	if offset < 0 {
+		return errors.Newf("%s offset must not be negative: %d", field, offset)
+	}
+	if size < 0 {
+		return errors.Newf("%s size must not be negative: %d", field, size)
+	}
+	if len(data)-offset < size {
+		return errors.Newf("%s requires %d byte at offset %d, but message has %d byte remaining", field, size, offset, max(len(data)-offset, 0))
+	}
+	return nil
 }
