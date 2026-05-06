@@ -41,7 +41,7 @@ type Slot struct {
 }
 
 func NewSlot(replicationDSN, standardDSN string, cfg Config, m metric.Metric, updater XLogUpdater) *Slot {
-	query := fmt.Sprintf("SELECT slot_name, slot_type, active, active_pid, restart_lsn, confirmed_flush_lsn, wal_status, PG_CURRENT_WAL_LSN() AS current_lsn FROM pg_replication_slots WHERE slot_name = '%s';", cfg.Name)
+	query := fmt.Sprintf("SELECT slot_name, slot_type, active, active_pid, restart_lsn, confirmed_flush_lsn, wal_status, PG_CURRENT_WAL_LSN() AS current_lsn FROM pg_replication_slots WHERE slot_name = %s;", pq.QuoteLiteral(cfg.Name))
 
 	return &Slot{
 		cfg:             cfg,
@@ -49,7 +49,7 @@ func NewSlot(replicationDSN, standardDSN string, cfg Config, m metric.Metric, up
 		replicationConn: pq.NewConnectionTemplate(replicationDSN),
 		statusSQL:       query,
 		metric:          m,
-		ticker:          time.NewTicker(time.Millisecond * cfg.SlotActivityCheckerInterval),
+		ticker:          time.NewTicker(cfg.SlotActivityCheckerInterval),
 		logUpdater:      updater,
 	}
 }
@@ -99,7 +99,7 @@ func (s *Slot) createSlotWithReplicationConn(ctx context.Context) error {
 		_ = s.replicationConn.Close(ctx)
 	}()
 
-	sql := fmt.Sprintf("CREATE_REPLICATION_SLOT %s LOGICAL pgoutput", s.cfg.Name)
+	sql := fmt.Sprintf("CREATE_REPLICATION_SLOT %s LOGICAL pgoutput", pq.QuoteIdentifier(s.cfg.Name))
 	resultReader := s.replicationConn.Exec(ctx, sql)
 	_, err := resultReader.ReadAll()
 	if err != nil {
