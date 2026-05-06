@@ -22,16 +22,16 @@ func New(conn pq.Connection) *Replication {
 
 func (r *Replication) Start(publicationName, slotName string, startLSN pq.LSN, protoVersion int) error {
 	pluginArguments := []string{
-		fmt.Sprintf("proto_version '%d'", protoVersion),
+		fmt.Sprintf("proto_version %s", pq.QuoteLiteral(strconv.Itoa(protoVersion))),
 	}
 
 	if protoVersion >= 2 {
 		pluginArguments = append(pluginArguments, "messages 'true'", "streaming 'true'")
 	}
 
-	pluginArguments = append(pluginArguments, "publication_names '"+publicationName+"'")
+	pluginArguments = append(pluginArguments, "publication_names "+pq.QuoteLiteral(publicationName))
 
-	sql := fmt.Sprintf("START_REPLICATION SLOT %s LOGICAL %s (%s)", slotName, startLSN, strings.Join(pluginArguments, ","))
+	sql := fmt.Sprintf("START_REPLICATION SLOT %s LOGICAL %s (%s)", pq.QuoteIdentifier(slotName), startLSN, strings.Join(pluginArguments, ", "))
 	r.conn.Frontend().SendQuery(&pgproto3.Query{String: sql})
 	err := r.conn.Frontend().Flush()
 	if err != nil {

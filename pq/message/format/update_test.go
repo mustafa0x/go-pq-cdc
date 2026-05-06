@@ -6,6 +6,7 @@ import (
 
 	"github.com/Trendyol/go-pq-cdc/pq/message/tuple"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestUpdate_New(t *testing.T) {
@@ -92,4 +93,29 @@ func TestUpdate_New(t *testing.T) {
 	}
 
 	assert.Equal(t, expected, msg)
+}
+
+func TestUpdateBoundsChecks(t *testing.T) {
+	t.Run("returns error when relation oid and tuple type are truncated", func(t *testing.T) {
+		msg, err := NewUpdate([]byte{'U', 0, 0, 0, 42}, false, nil, time.Now())
+
+		require.Error(t, err)
+		assert.Nil(t, msg)
+		assert.Contains(t, err.Error(), "update relation oid and tuple type")
+	})
+
+	t.Run("returns error when toast column exceeds old tuple columns", func(t *testing.T) {
+		data := []byte{'U'}
+		data = appendUint32ForTest(data, 42)
+		data = append(data,
+			'O', 0, 1, tuple.DataTypeText, 0, 0, 0, 1, 'a',
+			'N', 0, 2, tuple.DataTypeText, 0, 0, 0, 1, 'a', tuple.DataTypeToast,
+		)
+
+		msg, err := NewUpdate(data, false, map[uint32]*Relation{}, time.Now())
+
+		require.Error(t, err)
+		assert.Nil(t, msg)
+		assert.Contains(t, err.Error(), "exceeds old tuple column count")
+	})
 }

@@ -22,8 +22,8 @@ func (c Config) Validate() error {
 		err = errors.Join(err, errors.New("slot name cannot be empty"))
 	}
 
-	if c.SlotActivityCheckerInterval < 1000 {
-		err = errors.Join(err, errors.New("slot activity checker interval cannot be lower than 1000 ms"))
+	if c.SlotActivityCheckerInterval < time.Second {
+		err = errors.Join(err, errors.New("slot activity checker interval cannot be lower than 1s"))
 	}
 
 	if c.ProtoVersion != 0 && c.ProtoVersion != 1 && c.ProtoVersion != 2 {
