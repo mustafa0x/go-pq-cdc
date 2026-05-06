@@ -20,18 +20,20 @@ func quoteIdentifier(name string) string {
 
 // Heartbeat manages periodic heartbeat updates to prevent WAL bloat
 type Heartbeat struct {
-	conn   pq.Connection
-	dsn    string
-	cfg    config.HeartbeatConfig
-	mu     sync.Mutex
-	closed bool
+	conn        pq.Connection
+	dsn         string
+	updateQuery string
+	cfg         config.HeartbeatConfig
+	mu          sync.Mutex
+	closed      bool
 }
 
 // New creates a new Heartbeat instance
 func New(dsn string, cfg config.HeartbeatConfig) *Heartbeat {
 	return &Heartbeat{
-		dsn: dsn,
-		cfg: cfg,
+		dsn:         dsn,
+		updateQuery: heartbeatUpdateQuery(cfg),
+		cfg:         cfg,
 	}
 }
 
@@ -136,8 +138,7 @@ func (h *Heartbeat) execute(ctx context.Context) error {
 		h.conn = conn
 	}
 
-	query := h.query()
-	resultReader := h.conn.Exec(ctx, query)
+	resultReader := h.conn.Exec(ctx, h.updateQuery)
 	if resultReader == nil {
 		return fmt.Errorf("heartbeat exec returned nil resultReader")
 	}
@@ -158,10 +159,9 @@ func (h *Heartbeat) execute(ctx context.Context) error {
 	return nil
 }
 
-// query returns the auto-generated UPDATE query for heartbeat
-func (h *Heartbeat) query() string {
-	schema := quoteIdentifier(h.cfg.Table.Schema)
-	table := quoteIdentifier(h.cfg.Table.Name)
+func heartbeatUpdateQuery(cfg config.HeartbeatConfig) string {
+	schema := quoteIdentifier(cfg.Table.Schema)
+	table := quoteIdentifier(cfg.Table.Name)
 	return fmt.Sprintf(`UPDATE %s.%s SET last_heartbeat = NOW() WHERE id = 1`, schema, table)
 }
 
