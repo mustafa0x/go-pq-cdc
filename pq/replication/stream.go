@@ -62,6 +62,7 @@ type stream struct {
 	sinkEnd             chan struct{}
 	processEnd          chan struct{}
 	mu                  *sync.RWMutex
+	feedbackMu          sync.Mutex
 	config              config.Config
 	lastXLogPos         pq.LSN
 	confirmedXLogPos    pq.LSN
@@ -301,7 +302,7 @@ func (s *stream) sinkLoop(ctx context.Context, buf *messageBuffer, streamBuf *st
 			}
 			if pgconn.Timeout(err) {
 				if s.LoadXLogPos() > 0 {
-					if err = SendStandbyStatusUpdate(ctx, s.conn, uint64(s.LoadXLogPos()), uint64(s.LoadConfirmedXLogPos())); err != nil {
+					if err = s.sendStandbyStatusUpdate(ctx); err != nil {
 						logger.Error("send stand by status update", "error", err)
 						return true
 					}
@@ -364,7 +365,7 @@ func (s *stream) handleKeepalive(ctx context.Context, data []byte) error {
 	}
 
 	if pkm.ReplyRequested {
-		if err = SendStandbyStatusUpdate(ctx, s.conn, uint64(s.LoadXLogPos()), uint64(s.LoadConfirmedXLogPos())); err != nil {
+		if err = s.sendStandbyStatusUpdate(ctx); err != nil {
 			logger.Error("standby status update", "error", err)
 			return err
 		}
@@ -477,7 +478,7 @@ func (s *stream) process(ctx context.Context) {
 				pos := pq.LSN(msg.walStart)
 				s.UpdateConfirmedXLogPos(pos)
 				logger.Debug("send stand by status update", "xLogPos", s.LoadConfirmedXLogPos().String())
-				return SendStandbyStatusUpdate(ctx, s.conn, uint64(s.LoadXLogPos()), uint64(s.LoadConfirmedXLogPos()))
+				return s.sendStandbyStatusUpdate(ctx)
 			}
 
 			if s.isHeartbeatMessage(msg.message) {
@@ -675,6 +676,16 @@ func (s *stream) fetchSnapshotLSN(ctx context.Context) (pq.LSN, error) {
 
 	logger.Info("fetched snapshot LSN from database", "slotName", s.config.Slot.Name, "snapshotLSN", snapshotLSN.String())
 	return snapshotLSN, nil
+}
+
+// sendStandbyStatusUpdate serializes all frontend feedback writes on the
+// replication connection. pgconn/pgproto frontend writes must not race between
+// keepalive replies, timeout feedback, and listener ACK callbacks.
+func (s *stream) sendStandbyStatusUpdate(ctx context.Context) error {
+	s.feedbackMu.Lock()
+	defer s.feedbackMu.Unlock()
+
+	return SendStandbyStatusUpdate(ctx, s.conn, uint64(s.LoadXLogPos()), uint64(s.LoadConfirmedXLogPos()))
 }
 
 func SendStandbyStatusUpdate(_ context.Context, conn pq.Connection, walReceivedPosition, walFlushedPosition uint64) error {
