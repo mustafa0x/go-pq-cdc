@@ -57,6 +57,7 @@ type stream struct {
 	metric              metric.Metric
 	system              *pq.IdentifySystemResult
 	relation            map[uint32]*format.Relation
+	decoder             *message.Decoder
 	messageCH           chan *Message
 	listenerFunc        ListenerFunc
 	sinkEnd             chan struct{}
@@ -80,6 +81,7 @@ func NewStream(dsn string, cfg config.Config, m metric.Metric, listenerFunc List
 		metric:       m,
 		config:       cfg,
 		relation:     make(map[uint32]*format.Relation),
+		decoder:      message.NewDecoder(),
 		messageCH:    make(chan *Message, 1000),
 		listenerFunc: listenerFunc,
 		// lastXLogPos:0 is not magical, 0 means, create replication starts with confirmed_flush_lsn
@@ -395,7 +397,7 @@ func (s *stream) handleXLogData(data []byte, buf *messageBuffer, streamBuf *stre
 	s.UpdateXLogPos(xld.ServerWALEnd)
 	s.metric.SetCDCLatency(time.Since(xld.ServerTime).Milliseconds())
 
-	decodedMsg, err := message.New(xld.WALData, xld.ServerTime, s.relation)
+	decodedMsg, err := s.decoder.New(xld.WALData, xld.ServerTime, s.relation)
 	if err != nil || decodedMsg == nil {
 		logger.Debug("wal data message parsing error", "error", err)
 		return

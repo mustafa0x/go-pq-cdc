@@ -33,37 +33,51 @@ var ErrorByteNotSupported = errors.New("message byte not supported")
 
 type Type uint8
 
-var streamedTransaction bool
+type Decoder struct {
+	streamedTransaction bool
+}
+
+func NewDecoder() *Decoder {
+	return &Decoder{}
+}
 
 func New(data []byte, serverTime time.Time, relation map[uint32]*format.Relation) (any, error) {
+	return NewDecoder().New(data, serverTime, relation)
+}
+
+func (d *Decoder) New(data []byte, serverTime time.Time, relation map[uint32]*format.Relation) (any, error) {
+	if len(data) == 0 {
+		return nil, errors.Wrap(ErrorByteNotSupported, "empty message")
+	}
+
 	switch Type(data[0]) {
 	case BeginByte:
 		return format.NewBegin(data)
 	case CommitByte:
 		return format.NewCommit(data)
 	case InsertByte:
-		return format.NewInsert(data, streamedTransaction, relation, serverTime)
+		return format.NewInsert(data, d.streamedTransaction, relation, serverTime)
 	case UpdateByte:
-		return format.NewUpdate(data, streamedTransaction, relation, serverTime)
+		return format.NewUpdate(data, d.streamedTransaction, relation, serverTime)
 	case DeleteByte:
-		return format.NewDelete(data, streamedTransaction, relation, serverTime)
+		return format.NewDelete(data, d.streamedTransaction, relation, serverTime)
 	case TruncateByte:
-		return format.NewTruncate(data, streamedTransaction, relation, serverTime)
+		return format.NewTruncate(data, d.streamedTransaction, relation, serverTime)
 	case StreamStartByte:
-		streamedTransaction = true
+		d.streamedTransaction = true
 		return format.NewStreamStart(data)
 	case StreamStopByte:
-		streamedTransaction = false
+		d.streamedTransaction = false
 		return &format.StreamStop{}, nil
 	case StreamAbortByte:
-		streamedTransaction = false
+		d.streamedTransaction = false
 		return format.NewStreamAbort(data)
 	case StreamCommitByte:
-		streamedTransaction = false
+		d.streamedTransaction = false
 		return format.NewStreamCommit(data)
 	case RelationByte:
-		msg, err := format.NewRelation(data, streamedTransaction)
-		if err == nil {
+		msg, err := format.NewRelation(data, d.streamedTransaction)
+		if err == nil && relation != nil {
 			relation[msg.OID] = msg
 		}
 		return msg, err
