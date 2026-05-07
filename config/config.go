@@ -26,6 +26,7 @@ type Config struct {
 	Database         string             `json:"database" yaml:"database"`
 	Publication      publication.Config `json:"publication" yaml:"publication"`
 	Heartbeat        HeartbeatConfig    `json:"heartbeat" yaml:"heartbeat"`
+	Listener         ListenerConfig     `json:"listener" yaml:"listener"`
 	Slot             slot.Config        `json:"slot" yaml:"slot"`
 	Snapshot         SnapshotConfig     `json:"snapshot" yaml:"snapshot"`
 	Port             int                `json:"port" yaml:"port"`
@@ -50,6 +51,10 @@ type ExtensionSupport struct {
 type HeartbeatConfig struct {
 	Table    publication.Table `json:"table" yaml:"table"`
 	Interval time.Duration     `json:"interval" yaml:"interval"`
+}
+
+type ListenerConfig struct {
+	EmitTransactionBoundaries bool `json:"emitTransactionBoundaries" yaml:"emitTransactionBoundaries"`
 }
 
 // DSN returns a normal PostgreSQL connection string for regular database operations
@@ -271,7 +276,9 @@ func (c *Config) Validate() error {
 			err = errors.Join(err, cErr)
 		}
 
-		if cErr := c.Slot.Validate(); cErr != nil {
+		slotConfig := c.Slot
+		slotConfig.SlotActivityCheckerInterval = normalizeMillisecondsDuration(slotConfig.SlotActivityCheckerInterval, 0)
+		if cErr := slotConfig.Validate(); cErr != nil {
 			err = errors.Join(err, cErr)
 		}
 	}
