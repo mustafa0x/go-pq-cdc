@@ -23,7 +23,7 @@ jobs:
         run: |
           git apply --check .github/connector-lifecycle.patch
           git apply .github/connector-lifecycle.patch
-          rm .github/connector-lifecycle.patch .github/workflows/apply-sync-lifecycle.yml
+          rm -f .github/connector-lifecycle.patch .github/workflows/apply-sync-lifecycle.yml
           gofmt -w connector.go connector_lifecycle_test.go
           go test ./...
       - name: Replace staging history with verified commit
