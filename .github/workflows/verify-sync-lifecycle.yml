@@ -20,6 +20,10 @@ jobs:
         with:
           go-version: '1.22.4'
       - name: Test clean lifecycle commit
-        run: |
-          git show -s --format='COMMIT_TIME=%cI'
-          go test ./...
+        run: go test ./...
+      - name: Resolve module version
+        run: go list -m -f '{{.Version}}' github.com/mustafa0x/go-pq-cdc@${{ github.event.pull_request.head.sha }} > connector-version.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: connector-version
+          path: connector-version.txt
