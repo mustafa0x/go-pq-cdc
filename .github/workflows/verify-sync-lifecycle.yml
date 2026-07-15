@@ -1,0 +1,38 @@
+name: Verify sync lifecycle contract
+
+on:
+  pull_request:
+    branches: [sync-lifecycle-base]
+    types: [opened, reopened, synchronize]
+
+permissions:
+  contents: write
+
+jobs:
+  verify-and-commit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22.4'
+      - name: Apply and verify
+        run: |
+          git apply --check .github/connector-lifecycle.patch
+          git apply .github/connector-lifecycle.patch
+          rm .github/connector-lifecycle.patch .github/workflows/apply-sync-lifecycle.yml
+          gofmt -w connector.go connector_lifecycle_test.go
+          go test ./...
+      - name: Replace staging history with verified commit
+        env:
+          HEAD_BRANCH: ${{ github.event.pull_request.head.ref }}
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git reset --soft b2225e4136fabd5445ab225053a77202ac6dedee
+          git add -A
+          git commit -m 'connector: make startup lifecycle explicit'
+          git push --force origin HEAD:$HEAD_BRANCH
