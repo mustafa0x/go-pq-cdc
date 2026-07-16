@@ -94,6 +94,67 @@ func TestStreamCloseFlushesFinalConfirmedLSN(t *testing.T) {
 	}
 }
 
+func TestStreamCloseWaitsForInFlightAckBeforeFinalFlush(t *testing.T) {
+	logger.InitLogger(logger.NewSlog(slog.LevelError))
+
+	var written bytes.Buffer
+	conn := &standbyCaptureConn{
+		fe: pgproto3.NewFrontend(strings.NewReader(""), &written),
+	}
+	listenerEntered := make(chan struct{})
+	allowAck := make(chan struct{})
+	ackResult := make(chan error, 1)
+	stream := NewStream("", config.Config{}, metric.NewMetric("test_slot"), func(ctx *ListenerContext) {
+		close(listenerEntered)
+		<-allowAck
+		ackResult <- ctx.Ack()
+	}).(*stream)
+	stream.conn = conn
+	stream.UpdateXLogPos(200)
+	stream.messageCH <- &Message{message: struct{}{}, ackLSN: 150}
+	close(stream.messageCH)
+	stream.processStarted.Store(true)
+	go stream.process(context.Background())
+	<-listenerEntered
+
+	closed := make(chan struct{})
+	go func() {
+		stream.Close(context.Background())
+		close(closed)
+	}()
+	close(allowAck)
+
+	select {
+	case err := <-ackResult:
+		if err != nil {
+			t.Fatalf("in-flight Ack() error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("in-flight acknowledgement did not complete")
+	}
+	select {
+	case <-closed:
+	case <-time.After(time.Second):
+		t.Fatal("Close did not finish after in-flight acknowledgement")
+	}
+	if written.Len() == 0 {
+		t.Fatal("expected in-flight acknowledgement to be flushed")
+	}
+}
+
+func TestAckAfterStreamCloseFails(t *testing.T) {
+	stream := NewStream("", config.Config{}, metric.NewMetric("test_slot"), func(*ListenerContext) {}).(*stream)
+	ack := stream.ackFuncForMessage(&Message{ackLSN: 150}, &transactionAckTracker{})
+	stream.closed.Store(true)
+
+	if err := ack(); !errors.Is(err, ErrorStreamClosed) {
+		t.Fatalf("Ack() error = %v, want ErrorStreamClosed", err)
+	}
+	if got := stream.LoadConfirmedXLogPos(); got != 0 {
+		t.Fatalf("confirmed LSN = %s, want 0/0", got)
+	}
+}
+
 func requireCloseReturns(t *testing.T, stream Streamer, msg string) {
 	t.Helper()
 

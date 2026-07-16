@@ -15,7 +15,6 @@ import (
 	"github.com/Trendyol/go-pq-cdc/pq"
 	"github.com/Trendyol/go-pq-cdc/pq/message"
 	"github.com/Trendyol/go-pq-cdc/pq/message/format"
-	"github.com/avast/retry-go/v4"
 	"github.com/go-playground/errors"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgproto3"
@@ -24,6 +23,7 @@ import (
 var (
 	ErrorSlotInUse    = errors.New("replication slot in use")
 	ErrorNotConnected = errors.New("stream is not connected")
+	ErrorStreamClosed = goerrors.New("stream is closed")
 )
 
 const (
@@ -31,10 +31,13 @@ const (
 )
 
 type ListenerContext struct {
-	Message  any
+	Message any
+	// WALStart is the WAL start position for this decoded logical message.
 	WALStart pq.LSN
-	AckLSN   pq.LSN
-	Ack      func() error
+	// AckLSN is the LSN associated with this message's acknowledgement.
+	// In transaction-aware mode, only commit-boundary acknowledgements advance confirmed_flush_lsn.
+	AckLSN pq.LSN
+	Ack    func() error
 }
 
 type ListenerFunc func(ctx *ListenerContext)
@@ -63,31 +66,26 @@ type stream struct {
 	listenerFunc        ListenerFunc
 	sinkEnd             chan struct{}
 	processEnd          chan struct{}
-	mu                  *sync.RWMutex
+	doneCtx             context.Context
+	finish              context.CancelCauseFunc
+	mu                  sync.RWMutex
+	ackMu               sync.Mutex
 	config              config.Config
 	lastXLogPos         pq.LSN
 	confirmedXLogPos    pq.LSN
-	snapshotLSN         pq.LSN
 	openFromSnapshotLSN bool
 	closed              atomic.Bool
 	sinkStarted         atomic.Bool
 	processStarted      atomic.Bool
-	messageCloseOnce    sync.Once
-	// connMu serializes every use of conn while streaming. The sink goroutine
-	// reads with ReceiveMessage, which toggles the connection's socket deadline
-	// via pgconn's context watcher (SetDeadline(now) to interrupt the read, then
-	// SetDeadline(zero) to clear it). Standby status updates are written straight
-	// to the frontend, bypassing pgconn's own lock, and may be sent from the
-	// process goroutine or — when the consumer defers Ack — from a third
-	// goroutine entirely. A status-update write that lands in ReceiveMessage's
-	// deadline-cancel window inherits the past deadline and fails with an i/o
-	// timeout, corrupting the connection and panicking the sink. Holding connMu
-	// across the read and every write makes them mutually exclusive so that can't
-	// happen. connMu is always acquired before mu, never the reverse.
+	closeOnce           sync.Once
+	// connMu serializes every use of conn while streaming. ReceiveMessage toggles
+	// the socket deadline, so feedback writes must not overlap it. connMu is
+	// always acquired before mu, never the reverse.
 	connMu sync.Mutex
 }
 
 func NewStream(dsn string, cfg config.Config, m metric.Metric, listenerFunc ListenerFunc) Streamer {
+	doneCtx, finish := context.WithCancelCause(context.Background())
 	return &stream{
 		conn:         pq.NewConnectionTemplate(dsn),
 		metric:       m,
@@ -95,13 +93,10 @@ func NewStream(dsn string, cfg config.Config, m metric.Metric, listenerFunc List
 		relation:     make(map[uint32]*format.Relation),
 		messageCH:    make(chan *Message, 1000),
 		listenerFunc: listenerFunc,
-		// lastXLogPos:0 is not magical, 0 means, create replication starts with confirmed_flush_lsn
-		// https://github.com/postgres/postgres/blob/master/src/include/access/xlogdefs.h#L28
-		// https://github.com/postgres/postgres/blob/master/src/backend/replication/logical/logical.c#L540
-		lastXLogPos: 0,
-		sinkEnd:     make(chan struct{}, 1),
-		processEnd:  make(chan struct{}, 1),
-		mu:          &sync.RWMutex{},
+		sinkEnd:      make(chan struct{}),
+		processEnd:   make(chan struct{}),
+		doneCtx:      doneCtx,
+		finish:       finish,
 	}
 }
 
@@ -284,29 +279,27 @@ func (s *streamTxBuffer) discardTx(xid uint32) {
 
 func (s *stream) sink(ctx context.Context) {
 	logger.Info("postgres message sink started")
+	defer close(s.sinkEnd)
 
 	buf := &messageBuffer{outCh: s.messageCH}
-	streamBuf := &streamTxBuffer{}
-	corrupted := s.sinkLoop(ctx, buf, streamBuf)
-	s.messageCloseOnce.Do(func() {
-		close(s.messageCH)
-	})
+	streamErr := s.sinkLoop(ctx, buf, &streamTxBuffer{})
+	s.finish(streamErr)
+	close(s.messageCH)
 
-	s.sinkEnd <- struct{}{}
-	if !s.closed.Load() {
-		if corrupted {
-			logger.Error("postgres stream connection corrupted; closing stream")
-		}
-		s.Close(ctx)
+	if streamErr != nil && !goerrors.Is(streamErr, context.Canceled) {
+		logger.Error("postgres stream stopped", "error", streamErr)
 	}
 }
 
 // sinkLoop reads raw replication messages and dispatches them until the
-// connection is closed or a fatal error occurs. It returns true when the
-// connection is in a corrupted state.
-func (s *stream) sinkLoop(ctx context.Context, buf *messageBuffer, streamBuf *streamTxBuffer) (corrupted bool) {
+// connection is closed, its context is canceled, or a fatal error occurs.
+func (s *stream) sinkLoop(ctx context.Context, buf *messageBuffer, streamBuf *streamTxBuffer) error {
 	for {
-		msgCtx, cancel := context.WithDeadline(context.Background(), time.Now().Add(300*time.Millisecond))
+		if err := s.Err(); err != nil {
+			return err
+		}
+
+		msgCtx, cancel := context.WithTimeout(ctx, 300*time.Millisecond)
 		// Hold connMu only for the read itself. ReceiveMessage's deferred Unwatch
 		// (which clears the socket deadline) has run by the time it returns, so the
 		// deadline-toggle window is fully contained here; releasing before the
@@ -317,68 +310,76 @@ func (s *stream) sinkLoop(ctx context.Context, buf *messageBuffer, streamBuf *st
 		s.connMu.Unlock()
 		cancel()
 
+		if terminalErr := s.Err(); terminalErr != nil {
+			return terminalErr
+		}
 		if err != nil {
 			if s.closed.Load() {
 				logger.Info("stream stopped")
-				return false
+				return nil
+			}
+			if ctx.Err() != nil {
+				return context.Cause(ctx)
 			}
 			if pgconn.Timeout(err) {
 				if s.LoadXLogPos() > 0 {
-					if err = s.sendStandbyStatusUpdate(ctx); err != nil {
-						logger.Error("send stand by status update", "error", err)
-						return true
+					if err := s.sendStandbyStatusUpdate(ctx); err != nil {
+						return fmt.Errorf("send standby status update: %w", err)
 					}
 					logger.Debug("send stand by status update")
 				}
 				continue
 			}
-			logger.Error("receive message error", "error", err)
-			return true
+			return fmt.Errorf("receive replication message: %w", err)
 		}
 
-		copyData, ok := s.extractCopyData(rawMsg)
-		if !ok {
+		copyData, err := extractCopyData(rawMsg)
+		if err != nil {
+			return err
+		}
+		if copyData == nil {
 			continue
+		}
+		if len(copyData.Data) == 0 {
+			return goerrors.New("received empty replication copy data")
 		}
 
 		switch copyData.Data[0] {
 		case message.PrimaryKeepaliveMessageByteID:
 			if err := s.handleKeepalive(ctx, copyData.Data[1:]); err != nil {
-				return true
+				return fmt.Errorf("handle primary keepalive: %w", err)
 			}
 		case message.XLogDataByteID:
-			s.handleXLogData(copyData.Data[1:], buf, streamBuf)
+			if err := s.handleXLogData(copyData.Data[1:], buf, streamBuf); err != nil {
+				return err
+			}
+		default:
+			return fmt.Errorf("unsupported replication copy data type %q", copyData.Data[0])
 		}
 	}
 }
 
-// extractCopyData validates a raw backend message. It returns the CopyData
-// payload and true on success, or (nil, false) for protocol-level errors and
-// unexpected message types which are logged and skipped.
-func (s *stream) extractCopyData(rawMsg pgproto3.BackendMessage) (*pgproto3.CopyData, bool) {
-	if errMsg, ok := rawMsg.(*pgproto3.ErrorResponse); ok {
-		res, _ := errMsg.MarshalJSON()
-		logger.Error("receive postgres wal error: " + string(res))
-		return nil, false
+// extractCopyData returns replication payloads, ignores PostgreSQL sideband
+// messages, and rejects terminal or unexpected backend messages.
+func extractCopyData(rawMsg pgproto3.BackendMessage) (*pgproto3.CopyData, error) {
+	switch msg := rawMsg.(type) {
+	case *pgproto3.CopyData:
+		return msg, nil
+	case *pgproto3.NoticeResponse, *pgproto3.ParameterStatus, *pgproto3.NotificationResponse:
+		return nil, nil
+	case *pgproto3.ErrorResponse:
+		return nil, pgconn.ErrorResponseToPgError(msg)
+	default:
+		return nil, fmt.Errorf("unexpected replication backend message %T", rawMsg)
 	}
-
-	msg, ok := rawMsg.(*pgproto3.CopyData)
-	if !ok {
-		logger.Warn(fmt.Sprintf("received unexpected message: %T", rawMsg))
-		return nil, false
-	}
-
-	return msg, true
 }
 
 // handleKeepalive processes a primary keepalive message, updating the WAL
 // position and responding with a standby status update when requested.
-// A non-nil return signals a corrupted connection.
 func (s *stream) handleKeepalive(ctx context.Context, data []byte) error {
 	pkm, err := format.NewPrimaryKeepaliveMessage(data)
 	if err != nil {
-		logger.Error("decode primary keepalive message", "error", err)
-		return nil // non-fatal, skip
+		return fmt.Errorf("decode primary keepalive message: %w", err)
 	}
 
 	if pkm.ServerWALEnd > 0 {
@@ -387,8 +388,7 @@ func (s *stream) handleKeepalive(ctx context.Context, data []byte) error {
 	}
 
 	if pkm.ReplyRequested {
-		if err = s.sendStandbyStatusUpdate(ctx); err != nil {
-			logger.Error("standby status update", "error", err)
+		if err := s.sendStandbyStatusUpdate(ctx); err != nil {
 			return err
 		}
 		logger.Debug("standby status update sent on keepalive request")
@@ -399,15 +399,17 @@ func (s *stream) handleKeepalive(ctx context.Context, data []byte) error {
 
 // handleXLogData parses a WAL data message, decodes the logical replication
 // event, and dispatches it through the message buffer.
-func (s *stream) handleXLogData(data []byte, buf *messageBuffer, streamBuf *streamTxBuffer) {
+func (s *stream) handleXLogData(data []byte, buf *messageBuffer, streamBuf *streamTxBuffer) error {
 	xld, err := ParseXLogData(data)
 	if err != nil {
-		logger.Error("parse xLog data", "error", err)
-		return
+		return fmt.Errorf("parse xLog data: %w", err)
 	}
 
+	if len(xld.WALData) == 0 {
+		return goerrors.New("received empty logical replication message")
+	}
 	logger.Debug("wal received",
-		"walDataLen", len(xld.WALData),
+		"messageType", string(xld.WALData[0]),
 		"walStart", xld.WALStart,
 		"walEnd", xld.ServerWALEnd,
 		"serverTime", xld.ServerTime,
@@ -417,9 +419,15 @@ func (s *stream) handleXLogData(data []byte, buf *messageBuffer, streamBuf *stre
 	s.metric.SetCDCLatency(time.Now().UTC().Sub(xld.ServerTime).Nanoseconds())
 
 	decodedMsg, err := message.New(xld.WALData, streamBuf.streaming, xld.ServerTime, s.relation)
-	if err != nil || decodedMsg == nil {
-		logger.Debug("wal data message parsing error", "error", err)
-		return
+	if err != nil {
+		if ignorableLogicalMetadata(xld.WALData) {
+			logger.Debug("ignoring logical metadata message", "type", string(xld.WALData[0]))
+			return nil
+		}
+		return fmt.Errorf("decode logical message: %w", err)
+	}
+	if decodedMsg == nil {
+		return goerrors.New("logical message decoder returned nil without error")
 	}
 
 	// add LSN to insert/update/delete messages
@@ -433,6 +441,19 @@ func (s *stream) handleXLogData(data []byte, buf *messageBuffer, streamBuf *stre
 	}
 
 	s.dispatchMessage(decodedMsg, xld, buf, streamBuf)
+	return nil
+}
+
+func ignorableLogicalMetadata(data []byte) bool {
+	if len(data) == 0 {
+		return false
+	}
+	switch message.Type(data[0]) {
+	case message.TypeByte, message.OriginByte:
+		return true
+	default:
+		return false
+	}
 }
 
 // dispatchMessage routes a decoded logical replication event to the correct
@@ -498,62 +519,115 @@ func (s *stream) dispatchMessage(decodedMsg any, xld XLogData, buf *messageBuffe
 func (s *stream) process(ctx context.Context) {
 	logger.Info("postgres message process started")
 	defer func() {
-		s.processEnd <- struct{}{}
+		logger.Info("postgres message process stopped")
+		close(s.processEnd)
 	}()
 
-	for {
-		select {
-		case <-ctx.Done():
-			logger.Info("postgres message process stopped")
-			return
-		case msg, ok := <-s.messageCH:
-			if !ok {
-				logger.Info("postgres message process stopped")
-				return
-			}
-			if msg == nil {
-				continue
-			}
-
-			// Ack only advances the confirmed position in memory; the standby
-			// status update is flushed to Postgres by the sink loop (idle-timeout
-			// and keepalive-reply paths). Sending it here per message serializes
-			// every ack behind the sink's connMu-held read, collapsing throughput
-			// to a few messages/sec while a buffered transaction is drained.
-			// ponytail: coalesced via sink idle/keepalive flush; add a periodic
-			// in-sink flush if retention lag under sustained no-gap load matters.
-			ackFunc := func() error {
-				s.UpdateConfirmedXLogPos(msg.ackLSN)
-				return nil
-			}
-
-			if s.isHeartbeatMessage(msg.message) {
-				if err := ackFunc(); err != nil {
-					logger.Error("heartbeat auto-ack failed", "error", err)
-				}
-				continue
-			}
-
-			lCtx := &ListenerContext{
-				Message:  msg.message,
-				WALStart: msg.walStart,
-				AckLSN:   msg.ackLSN,
-				Ack:      ackFunc,
-			}
-
-			switch lCtx.Message.(type) {
-			case *format.Insert:
-				s.metric.InsertOpIncrement(1)
-			case *format.Delete:
-				s.metric.DeleteOpIncrement(1)
-			case *format.Update:
-				s.metric.UpdateOpIncrement(1)
-			}
-
-			start := time.Now().UTC()
-			s.listenerFunc(lCtx)
-			s.metric.SetProcessLatency(time.Since(start).Nanoseconds())
+	ackTracker := &transactionAckTracker{}
+	for msg := range s.messageCH {
+		if msg == nil || ctx.Err() != nil || s.doneCtx.Err() != nil {
+			continue
 		}
+
+		ackFunc := s.ackFuncForMessage(msg, ackTracker)
+		if s.isHeartbeatMessage(msg.message) {
+			if err := ackFunc(); err != nil {
+				s.finish(fmt.Errorf("heartbeat auto-ack: %w", err))
+			}
+			continue
+		}
+
+		lCtx := &ListenerContext{
+			Message:  msg.message,
+			WALStart: msg.walStart,
+			AckLSN:   msg.ackLSN,
+			Ack:      ackFunc,
+		}
+
+		switch lCtx.Message.(type) {
+		case *format.Insert:
+			s.metric.InsertOpIncrement(1)
+		case *format.Delete:
+			s.metric.DeleteOpIncrement(1)
+		case *format.Update:
+			s.metric.UpdateOpIncrement(1)
+		}
+
+		start := time.Now().UTC()
+		s.listenerFunc(lCtx)
+		s.metric.SetProcessLatency(time.Since(start).Nanoseconds())
+	}
+}
+
+type transactionAckCheckpoint struct {
+	lsn   pq.LSN
+	acked bool
+	next  *transactionAckCheckpoint
+}
+
+// transactionAckTracker keeps PostgreSQL's cumulative acknowledgement from
+// passing an earlier commit that the consumer has not made durable yet.
+type transactionAckTracker struct {
+	head *transactionAckCheckpoint
+	tail *transactionAckCheckpoint
+	mu   sync.Mutex
+}
+
+func (t *transactionAckTracker) register(lsn pq.LSN) *transactionAckCheckpoint {
+	checkpoint := &transactionAckCheckpoint{lsn: lsn}
+	t.mu.Lock()
+	if t.tail == nil {
+		t.head = checkpoint
+	} else {
+		t.tail.next = checkpoint
+	}
+	t.tail = checkpoint
+	t.mu.Unlock()
+	return checkpoint
+}
+
+func (t *transactionAckTracker) ack(checkpoint *transactionAckCheckpoint, advance func(pq.LSN)) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	checkpoint.acked = true
+	for t.head != nil && t.head.acked {
+		advance(t.head.lsn)
+		t.head = t.head.next
+	}
+	if t.head == nil {
+		t.tail = nil
+	}
+}
+
+func (s *stream) ackFuncForMessage(msg *Message, tracker *transactionAckTracker) func() error {
+	transactionAware := s.config.Listener.EmitTransactionBoundaries
+	var checkpoint *transactionAckCheckpoint
+	if transactionAware && isTransactionCommitBoundary(msg.message) {
+		checkpoint = tracker.register(msg.ackLSN)
+	}
+
+	return func() error {
+		s.ackMu.Lock()
+		defer s.ackMu.Unlock()
+		if s.closed.Load() {
+			return ErrorStreamClosed
+		}
+		if !transactionAware {
+			s.UpdateConfirmedXLogPos(msg.ackLSN)
+		} else if checkpoint != nil {
+			tracker.ack(checkpoint, s.UpdateConfirmedXLogPos)
+		}
+		return nil
+	}
+}
+
+func isTransactionCommitBoundary(msg any) bool {
+	switch msg.(type) {
+	case *format.Commit, *format.StreamCommit:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -578,33 +652,51 @@ func (s *stream) isHeartbeatMessage(msg any) bool {
 }
 
 func (s *stream) Close(ctx context.Context) {
-	if !s.closed.CompareAndSwap(false, true) {
-		return
-	}
+	s.closeOnce.Do(func() {
+		// Stop new delivery first, while keeping the connection available for an
+		// acknowledgement from the listener callback already in flight.
+		s.finish(context.Canceled)
 
-	if s.sinkStarted.Load() {
-		select {
-		case <-s.sinkEnd:
-			logger.Info("postgres message sink stopped")
-		case <-ctx.Done():
-			logger.Warn("timed out waiting for postgres message sink", "error", ctx.Err())
+		if s.sinkStarted.Load() {
+			select {
+			case <-s.sinkEnd:
+				logger.Info("postgres message sink stopped")
+			case <-ctx.Done():
+				logger.Warn("timed out waiting for postgres message sink", "error", ctx.Err())
+			}
 		}
-	}
 
-	if s.processStarted.Load() {
-		select {
-		case <-s.processEnd:
-			logger.Info("postgres message process stopped")
-		case <-ctx.Done():
-			logger.Warn("timed out waiting for postgres message process", "error", ctx.Err())
+		if s.processStarted.Load() {
+			select {
+			case <-s.processEnd:
+				logger.Info("postgres message process stopped")
+			case <-ctx.Done():
+				logger.Warn("timed out waiting for postgres message process", "error", ctx.Err())
+			}
 		}
-	}
 
-	if !s.conn.IsClosed() {
-		s.flushFinalStandbyStatusUpdate(ctx)
-		_ = s.conn.Close(ctx)
-		logger.Info("postgres connection closed")
-	}
+		// Once the processor is done, no synchronous listener acknowledgement can
+		// race this final flush. Asynchronous late acknowledgements fail closed.
+		s.ackMu.Lock()
+		s.closed.Store(true)
+		if !s.conn.IsClosed() {
+			s.flushFinalStandbyStatusUpdate(ctx)
+			if err := s.conn.Close(ctx); err != nil {
+				logger.Warn("close postgres connection", "error", err)
+			} else {
+				logger.Info("postgres connection closed")
+			}
+		}
+		s.ackMu.Unlock()
+	})
+}
+
+func (s *stream) Done() <-chan struct{} {
+	return s.doneCtx.Done()
+}
+
+func (s *stream) Err() error {
+	return context.Cause(s.doneCtx)
 }
 
 func (s *stream) GetSystemInfo() *pq.IdentifySystemResult {
@@ -613,10 +705,6 @@ func (s *stream) GetSystemInfo() *pq.IdentifySystemResult {
 
 func (s *stream) GetMetric() metric.Metric {
 	return s.metric
-}
-
-func (s *stream) SetSnapshotLSN(lsn pq.LSN) {
-	s.snapshotLSN = lsn
 }
 
 func (s *stream) UpdateXLogPos(l pq.LSN) {
@@ -653,85 +741,57 @@ func (s *stream) OpenFromSnapshotLSN() {
 	s.openFromSnapshotLSN = true
 }
 
-// fetchSnapshotLSN queries the database to get the snapshot LSN from cdc_snapshot_job table
-// Uses infinite retry with exponential backoff for resilience against transient database errors
+// fetchSnapshotLSN reads the completed snapshot checkpoint used to start CDC.
 func (s *stream) fetchSnapshotLSN(ctx context.Context) (pq.LSN, error) {
-	logger.Info("fetching snapshot LSN from database", "slotName", s.config.Slot.Name)
-
-	var snapshotLSN pq.LSN
-
-	err := retry.Do(
-		func() error {
-			// Create a separate connection for querying metadata
-			// Use regular DSN (not replication DSN) for normal SQL queries
-			conn, err := pq.NewConnection(ctx, s.config.DSN())
-			if err != nil {
-				return errors.Wrap(err, "create connection for snapshot LSN query")
-			}
-			defer conn.Close(ctx)
-
-			query := fmt.Sprintf(`
-				SELECT snapshot_lsn, completed 
-				FROM cdc_snapshot_job 
-				WHERE slot_name = %s
-			`, pq.QuoteLiteral(s.config.Slot.Name))
-
-			resultReader := conn.Exec(ctx, query)
-			results, err := resultReader.ReadAll()
-			if err != nil {
-				resultReader.Close()
-				return errors.Wrap(err, "execute snapshot LSN query")
-			}
-
-			if err = resultReader.Close(); err != nil {
-				return errors.Wrap(err, "close result reader")
-			}
-
-			if len(results) == 0 || len(results[0].Rows) == 0 {
-				return retry.Unrecoverable(errors.New("no snapshot job found for slot: " + s.config.Slot.Name))
-			}
-
-			row := results[0].Rows[0]
-
-			completed := string(row[1]) == "true" || string(row[1]) == "t"
-			if !completed {
-				return errors.New("snapshot job not completed yet for slot: " + s.config.Slot.Name)
-			}
-
-			lsnStr := string(row[0])
-			if lsnStr == "" {
-				return retry.Unrecoverable(errors.New("empty snapshot LSN result"))
-			}
-
-			snapshotLSN, err = pq.ParseLSN(lsnStr)
-			if err != nil {
-				return retry.Unrecoverable(errors.Wrap(err, "parse snapshot LSN: "+lsnStr))
-			}
-
-			return nil
-		},
-		retry.Attempts(0),                   // 0 means infinite retries
-		retry.DelayType(retry.BackOffDelay), // Exponential backoff
-		retry.OnRetry(func(n uint, err error) {
-			logger.Error("error in snapshot LSN fetch, retrying",
-				"attempt", n+1,
-				"error", err,
-				"slotName", s.config.Slot.Name)
-		}),
-	)
+	conn, err := pq.NewConnection(ctx, s.config.DSN())
 	if err != nil {
-		return 0, errors.Wrap(err, "failed to fetch snapshot LSN")
+		return 0, errors.Wrap(err, "connect for snapshot LSN")
+	}
+	defer func() {
+		closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = conn.Close(closeCtx)
+	}()
+
+	query := fmt.Sprintf(`
+		SELECT snapshot_lsn, completed
+		FROM cdc_snapshot_job
+		WHERE slot_name = %s
+	`, pq.QuoteLiteral(s.config.Slot.Name))
+	reader := conn.Exec(ctx, query)
+	results, err := reader.ReadAll()
+	if err != nil {
+		_ = reader.Close()
+		return 0, errors.Wrap(err, "read snapshot LSN")
+	}
+	if err := reader.Close(); err != nil {
+		return 0, errors.Wrap(err, "close snapshot LSN result")
+	}
+	if len(results) == 0 || len(results[0].Rows) == 0 {
+		return 0, errors.New("snapshot job not found for slot: " + s.config.Slot.Name)
 	}
 
-	logger.Info("fetched snapshot LSN from database", "slotName", s.config.Slot.Name, "snapshotLSN", snapshotLSN.String())
-	return snapshotLSN, nil
+	row := results[0].Rows[0]
+	if len(row) < 2 {
+		return 0, errors.New("invalid snapshot job row")
+	}
+	if completed := string(row[1]); completed != "t" && completed != "true" {
+		return 0, errors.New("snapshot job not completed for slot: " + s.config.Slot.Name)
+	}
+
+	lsn, err := pq.ParseLSN(string(row[0]))
+	if err != nil {
+		return 0, errors.Wrap(err, "parse snapshot LSN")
+	}
+	logger.Info("fetched snapshot LSN", "slotName", s.config.Slot.Name, "snapshotLSN", lsn.String())
+	return lsn, nil
 }
 
 // sendStandbyStatusUpdate writes a standby status update under connMu so it can
 // never overlap the sink loop's ReceiveMessage, which toggles the connection's
-// socket deadline. Every status-update write — idle keepalive, reply-on-request,
-// and consumer Ack — must go through here rather than calling
-// SendStandbyStatusUpdate directly. See the connMu field comment.
+// socket deadline. Every status-update write — idle keepalive,
+// reply-on-request, and final close feedback — must go through here rather than
+// calling SendStandbyStatusUpdate directly. See the connMu field comment.
 func (s *stream) sendStandbyStatusUpdate(ctx context.Context) error {
 	s.connMu.Lock()
 	defer s.connMu.Unlock()

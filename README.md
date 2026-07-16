@@ -69,14 +69,16 @@ package main
 
 import (
 	"context"
+	"errors"
+	"log/slog"
+	"os"
+
 	cdc "github.com/Trendyol/go-pq-cdc"
 	"github.com/Trendyol/go-pq-cdc/config"
 	"github.com/Trendyol/go-pq-cdc/pq/message/format"
 	"github.com/Trendyol/go-pq-cdc/pq/publication"
 	"github.com/Trendyol/go-pq-cdc/pq/replication"
 	"github.com/Trendyol/go-pq-cdc/pq/slot"
-	"log/slog"
-	"os"
 )
 
 func main() {
@@ -121,8 +123,10 @@ func main() {
 		os.Exit(1)
 	}
 
-	defer connector.Close()
-	connector.Start(ctx)
+	if err := connector.Start(ctx); err != nil && !errors.Is(err, context.Canceled) {
+		slog.Error("run connector", "error", err)
+		os.Exit(1)
+	}
 }
 
 func Handler(ctx *replication.ListenerContext) {

@@ -431,9 +431,10 @@ package main
 
 import (
     "context"
-    "log"
     "encoding/json"
-    
+    "errors"
+    "log"
+
     cdc "github.com/Trendyol/go-pq-cdc"
     "github.com/Trendyol/go-pq-cdc/config"
     "github.com/Trendyol/go-pq-cdc/pq/message/format"
@@ -454,10 +455,10 @@ func main() {
     if err != nil {
         log.Fatal(err)
     }
-    defer connector.Close()
-    
     // Start (snapshot + CDC)
-    connector.Start(ctx)
+    if err := connector.Start(ctx); err != nil && !errors.Is(err, context.Canceled) {
+        log.Fatal(err)
+    }
 }
 
 func handleMessage(ctx *replication.ListenerContext) {

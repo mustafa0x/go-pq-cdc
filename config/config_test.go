@@ -320,6 +320,30 @@ func TestSnapshotConfigID(t *testing.T) {
 	})
 }
 
+func TestSnapshotConfigValidateLeaseTiming(t *testing.T) {
+	base := SnapshotConfig{
+		Enabled:           true,
+		Mode:              SnapshotModeInitial,
+		ChunkSize:         1000,
+		ClaimTimeout:      30 * time.Second,
+		HeartbeatInterval: 5 * time.Second,
+	}
+
+	t.Run("accepts heartbeat at half the claim timeout", func(t *testing.T) {
+		cfg := base
+		cfg.HeartbeatInterval = 15 * time.Second
+		assert.NoError(t, cfg.Validate())
+	})
+
+	t.Run("rejects heartbeat above half the claim timeout", func(t *testing.T) {
+		cfg := base
+		cfg.HeartbeatInterval = 16 * time.Second
+		err := cfg.Validate()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "half the claim timeout")
+	})
+}
+
 func TestValidateSnapshotSubset(t *testing.T) {
 	t.Run("should preserve SnapshotPartitionStrategy from snapshot config", func(t *testing.T) {
 		cfg := Config{

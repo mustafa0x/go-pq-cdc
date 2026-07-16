@@ -19,8 +19,9 @@ var typeMap = pgtype.NewMap()
 var HyperTables = sync.Map{}
 
 type TimescaleDB struct {
-	conn   pq.Connection
-	ticker *time.Ticker
+	conn      pq.Connection
+	stopCh    chan struct{}
+	closeOnce sync.Once
 }
 
 func NewTimescaleDB(ctx context.Context, dsn string) (*TimescaleDB, error) {
@@ -29,11 +30,24 @@ func NewTimescaleDB(ctx context.Context, dsn string) (*TimescaleDB, error) {
 		return nil, errors.Wrap(err, "new postgresql connection")
 	}
 
-	return &TimescaleDB{conn: conn, ticker: time.NewTicker(time.Second)}, nil
+	return &TimescaleDB{
+		conn:   conn,
+		stopCh: make(chan struct{}),
+	}, nil
 }
 
 func (tdb *TimescaleDB) SyncHyperTables(ctx context.Context) {
-	for range tdb.ticker.C {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tdb.stopCh:
+			return
+		case <-ticker.C:
+		}
+
 		hyperTables, err := tdb.FindHyperTables(ctx)
 		if err != nil {
 			logger.Error("timescale tables", "error", err)
@@ -52,7 +66,7 @@ func (tdb *TimescaleDB) FindHyperTables(ctx context.Context) (map[string]string,
 		var pgErr *pgconn.PgError
 		if goerrors.As(err, &pgErr) {
 			if pgErr.Code == "42P01" {
-				tdb.ticker.Stop()
+				tdb.Close(ctx)
 				logger.Debug("timescale db hypertable relation not found", "error", err)
 				return nil, nil
 			}
@@ -79,6 +93,20 @@ func (tdb *TimescaleDB) FindHyperTables(ctx context.Context) (map[string]string,
 	}
 
 	return ht, nil
+}
+
+func (tdb *TimescaleDB) Close(ctx context.Context) {
+	if tdb == nil {
+		return
+	}
+	tdb.closeOnce.Do(func() {
+		close(tdb.stopCh)
+		if tdb.conn != nil {
+			if err := tdb.conn.Close(ctx); err != nil {
+				logger.Warn("close timescale connection", "error", err)
+			}
+		}
+	})
 }
 
 func decodeHyperTablesResult(results []*pgconn.Result) (map[string]string, error) {

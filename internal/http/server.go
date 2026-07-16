@@ -29,7 +29,6 @@ type server struct {
 	slotInfoProvider SlotInfoProvider
 	server           http.Server
 	cdcConfig        config.Config
-	closed           bool
 }
 
 func NewServer(cfg config.Config, registry metric.Registry, slotInfoProvider SlotInfoProvider) Server {
@@ -74,11 +73,11 @@ func (s *server) Listen() {
 	logger.Info(fmt.Sprintf("server starting on port :%d", s.cdcConfig.Metric.Port))
 
 	err := s.server.ListenAndServe()
+	if errors.Is(err, http.ErrServerClosed) {
+		logger.Info("server stopped")
+		return
+	}
 	if err != nil {
-		if errors.Is(err, http.ErrServerClosed) && s.closed {
-			logger.Info("server stopped")
-			return
-		}
 		logger.Error("server cannot start", "port", s.cdcConfig.Metric.Port, "error", err)
 	}
 }
@@ -87,13 +86,11 @@ func (s *server) Shutdown() {
 	if s == nil {
 		return
 	}
-	s.closed = true
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	err := s.server.Shutdown(ctx)
-	if err != nil {
-		logger.Error("error while api cannot be shutdown", "error", err)
+	if err := s.server.Shutdown(ctx); err != nil {
+		logger.Error("shutdown server", "error", err)
 	}
 }
 

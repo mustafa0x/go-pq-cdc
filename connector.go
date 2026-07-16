@@ -4,7 +4,6 @@ import (
 	"context"
 	goerrors "errors"
 	"fmt"
-	"os"
 	"os/signal"
 	"strings"
 	"sync"
@@ -37,21 +36,35 @@ type Connector interface {
 	SetMetricCollectors(collectors ...prometheus.Collector)
 }
 
+// runningStreamer is connector-internal so adding lifecycle observation does
+// not break external implementations of replication.Streamer.
+type runningStreamer interface {
+	replication.Streamer
+	Done() <-chan struct{}
+	Err() error
+}
+
+// ErrConnectorStarted is returned when Start is called more than once.
+var ErrConnectorStarted = goerrors.New("connector already started")
+
+const connectorShutdownTimeout = 30 * time.Second
+
 type connector struct {
 	heartbeat          *heartbeat.Heartbeat
 	prometheusRegistry metric.Registry
 	server             http.Server
-	stream             replication.Streamer
+	stream             runningStreamer
 	timescaleDB        *timescaledb.TimescaleDB
 	slot               *slot.Slot
-	cancelCh           chan os.Signal
 	readyCh            chan struct{}
 	cfg                *config.Config
 	snapshotter        *snapshot.Snapshotter
 	listenerFunc       replication.ListenerFunc
-	serverOnce         sync.Once
-	readyOnce          sync.Once
-	closeOnce          sync.Once
+	stopOnce           sync.Once
+	cleanupOnce        sync.Once
+	runMu              sync.Mutex
+	runCancel          context.CancelCauseFunc
+	runDone            chan struct{}
 	stopCh             chan struct{}
 }
 
@@ -94,13 +107,16 @@ func NewConnector(ctx context.Context, cfg config.Config, listenerFunc replicati
 	if err != nil {
 		return nil, err
 	}
+	defer func() {
+		closeCtx, cancel := context.WithTimeout(context.Background(), connectorShutdownTimeout)
+		defer cancel()
+		_ = conn.Close(closeCtx)
+	}()
 
 	hb, publicationInfo, err := setupHeartbeatAndPublication(ctx, cfg, conn)
 	if err != nil {
-		conn.Close(ctx)
 		return nil, err
 	}
-	conn.Close(ctx)
 
 	m := metric.NewMetric(cfg.Slot.Name)
 
@@ -115,31 +131,38 @@ func NewConnector(ctx context.Context, cfg config.Config, listenerFunc replicati
 		return nil, err
 	}
 
-	stream := replication.NewStream(cfg.ReplicationDSN(), cfg, m, listenerFunc)
+	stream, ok := replication.NewStream(cfg.ReplicationDSN(), cfg, m, listenerFunc).(runningStreamer)
+	if !ok {
+		if snapshotter != nil {
+			snapshotter.Close(ctx)
+		}
+		return nil, goerrors.New("replication stream does not expose terminal state")
+	}
 
 	sl := slot.NewSlot(cfg.ReplicationDSN(), cfg.DSN(), cfg.Slot, m, stream.(slot.XLogUpdater))
 
 	prometheusRegistry := metric.NewRegistry(m)
 
-	tdb, err := initializeTimescaleDB(ctx, cfg)
-	if err != nil {
-		return nil, err
-	}
-
-	return &connector{
+	c := &connector{
 		cfg:                &cfg,
 		stream:             stream,
 		prometheusRegistry: prometheusRegistry,
 		server:             http.NewServer(cfg, prometheusRegistry, sl),
 		slot:               sl,
 		heartbeat:          hb,
-		timescaleDB:        tdb,
 		snapshotter:        snapshotter,
 		listenerFunc:       listenerFunc,
-		cancelCh:           make(chan os.Signal, 1),
 		readyCh:            make(chan struct{}),
 		stopCh:             make(chan struct{}),
-	}, nil
+	}
+
+	c.timescaleDB, err = initializeTimescaleDB(ctx, cfg)
+	if err != nil {
+		c.Close()
+		return nil, err
+	}
+
+	return c, nil
 }
 
 // newSnapshotOnlyConnector creates a minimal connector for snapshot-only mode
@@ -170,7 +193,6 @@ func newSnapshotOnlyConnector(ctx context.Context, cfg config.Config, listenerFu
 		server:             http.NewServer(cfg, prometheusRegistry, nil),
 		snapshotter:        snapshotter,
 		listenerFunc:       listenerFunc,
-		cancelCh:           make(chan os.Signal, 1),
 		readyCh:            make(chan struct{}),
 		stopCh:             make(chan struct{}),
 		// CDC components left nil: system, stream, slot
@@ -206,6 +228,7 @@ func initializeTimescaleDB(ctx context.Context, cfg config.Config) (*timescaledb
 		return nil, err
 	}
 	if _, err = tdb.FindHyperTables(ctx); err != nil {
+		tdb.Close(ctx)
 		return nil, err
 	}
 	return tdb, nil
@@ -231,20 +254,49 @@ func initializeSnapshot(ctx context.Context, cfg config.Config, tables publicati
 	return snapshot.New(ctx, cfg.Snapshot, tables, cfg.DSN(), m)
 }
 
-func (c *connector) Start(ctx context.Context) error {
-	c.serverOnce.Do(func() {
-		go c.server.Listen()
-	})
+func (c *connector) Start(parent context.Context) (err error) {
+	c.runMu.Lock()
+	if c.runCancel != nil {
+		c.runMu.Unlock()
+		return ErrConnectorStarted
+	}
+	if c.stopped() {
+		c.runMu.Unlock()
+		return context.Canceled
+	}
+	signalCtx, stopSignals := signal.NotifyContext(parent, syscall.SIGTERM, syscall.SIGINT)
+	defer stopSignals()
+	ctx, cancel := context.WithCancelCause(signalCtx)
+	done := make(chan struct{})
+	c.runCancel = cancel
+	c.runDone = done
+	c.runMu.Unlock()
+	defer func() {
+		if c.stopped() || parent.Err() == nil && signalCtx.Err() != nil {
+			err = nil
+		} else if parent.Err() != nil {
+			err = context.Cause(parent)
+		}
+		cancel(err)
+		c.stopOnce.Do(func() { close(c.stopCh) })
+		c.cleanup()
+		close(done)
+	}()
 
 	if err := c.errIfStopped(ctx); err != nil {
 		logger.Debug("connector start canceled before startup", "error", err)
 		return err
 	}
 
+	go c.server.Listen()
+
 	// Snapshot-only mode: execute snapshot and exit
 	if c.cfg.IsSnapshotOnlyMode() {
-		// Check if snapshot already completed (resume capability)
-		if !c.shouldTakeSnapshotOnly(ctx) {
+		takeSnapshot, err := c.shouldTakeSnapshotOnly(ctx)
+		if err != nil {
+			return err
+		}
+		if !takeSnapshot {
 			logger.Info("snapshot-only already completed, exiting")
 			c.signalReady()
 			return nil
@@ -259,9 +311,11 @@ func (c *connector) Start(ctx context.Context) error {
 		return nil
 	}
 
-	// Snapshot Pre-phase (optional): Prepare → CreateSlot → Execute
-	// This happens BEFORE the normal CDC flow to avoid data loss
-	if c.cfg.Snapshot.Enabled && c.shouldTakeSnapshot(ctx) {
+	takeSnapshot, err := c.shouldTakeSnapshot(ctx)
+	if err != nil {
+		return err
+	}
+	if takeSnapshot {
 		if err := c.prepareSnapshotAndSlot(ctx); err != nil {
 			logger.Error("snapshot preparation failed", "error", err)
 			return err
@@ -320,24 +374,37 @@ func (c *connector) Start(ctx context.Context) error {
 		go c.timescaleDB.SyncHyperTables(ctx)
 	}
 
-	signal.Notify(c.cancelCh, syscall.SIGTERM, syscall.SIGINT, syscall.SIGABRT, syscall.SIGQUIT)
-	defer signal.Stop(c.cancelCh)
-
 	c.signalReady()
+	return c.waitUntilStopped(ctx, parent)
+}
 
-	var stopErr error
+func (c *connector) waitUntilStopped(ctx, parent context.Context) error {
+	if c.stopped() {
+		return nil
+	}
 	select {
-	case sig := <-c.cancelCh:
-		logger.Debug("cancel channel triggered", "signal", sig)
-	case <-ctx.Done():
-		stopErr = ctx.Err()
-		logger.Debug("context canceled", "error", stopErr)
 	case <-c.stopCh:
 		logger.Debug("connector close requested")
+		return nil
+	case <-ctx.Done():
+		if c.stopped() || parent.Err() == nil {
+			return nil
+		}
+		cause := context.Cause(ctx)
+		logger.Debug("context canceled", "error", cause)
+		return cause
+	case <-c.stream.Done():
+		if c.stopped() {
+			return nil
+		}
+		if cause := context.Cause(ctx); cause != nil {
+			return cause
+		}
+		if err := c.stream.Err(); err != nil {
+			return fmt.Errorf("replication stream stopped: %w", err)
+		}
+		return goerrors.New("replication stream stopped")
 	}
-
-	c.Close()
-	return stopErr
 }
 
 func (c *connector) openStream(ctx context.Context) error {
@@ -361,90 +428,65 @@ func (c *connector) openStream(ctx context.Context) error {
 }
 
 func (c *connector) errIfStopped(ctx context.Context) error {
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-c.stopCh:
+	if c.stopped() {
 		return context.Canceled
+	}
+	return context.Cause(ctx)
+}
+
+func (c *connector) stopped() bool {
+	select {
+	case <-c.stopCh:
+		return true
 	default:
-		return nil
+		return false
 	}
 }
 
 func (c *connector) signalReady() {
-	c.readyOnce.Do(func() {
-		close(c.readyCh)
-	})
+	close(c.readyCh)
 }
 
-func (c *connector) shouldTakeSnapshot(ctx context.Context) bool {
-	if !c.cfg.Snapshot.Enabled {
-		return false
+func (c *connector) shouldTakeSnapshot(ctx context.Context) (bool, error) {
+	if !c.cfg.Snapshot.Enabled || c.cfg.Snapshot.Mode == config.SnapshotModeNever {
+		return false, nil
+	}
+	if err := c.snapshotter.EnsureMetadataTables(ctx); err != nil {
+		return false, fmt.Errorf("initialize snapshot metadata: %w", err)
+	}
+	if c.cfg.Snapshot.Resnapshot {
+		logger.Info("resnapshot enabled, cleaning metadata for slot", "slotName", c.cfg.Slot.Name)
+		if err := c.snapshotter.CleanupJobForSlot(ctx, c.cfg.Slot.Name); err != nil {
+			return false, errors.Wrap(err, "clean snapshot metadata")
+		}
+		return true, nil
 	}
 
-	switch c.cfg.Snapshot.Mode {
-	case config.SnapshotModeNever:
-		return false
-	case config.SnapshotModeInitial:
-		// If resnapshot is enabled, clean metadata for THIS slot only and return true
-		if c.cfg.Snapshot.Resnapshot {
-			logger.Info("resnapshot enabled, cleaning metadata for slot", "slotName", c.cfg.Slot.Name)
-			if err := c.snapshotter.CleanupJobForSlot(ctx, c.cfg.Slot.Name); err != nil {
-				logger.Warn("failed to cleanup job for resnapshot", "error", err)
-			}
-			return true
-		}
-
-		job, err := c.snapshotter.LoadJob(ctx, c.cfg.Slot.Name)
-		if err != nil {
-			logger.Debug("failed to load snapshot job state, will take snapshot", "error", err)
-			return true
-		}
-		return job == nil || !job.Completed
-	default:
-		logger.Warn("invalid snapshot mode, skipping snapshot", "mode", c.cfg.Snapshot.Mode)
-		return false
+	job, err := c.snapshotter.LoadJob(ctx, c.cfg.Slot.Name)
+	if err != nil {
+		return false, errors.Wrap(err, "load snapshot job")
 	}
+	return job == nil || !job.Completed, nil
 }
 
-// prepareSnapshotAndSlot handles the snapshot preparation with two-phase approach:
-// 1. Prepare: Capture LSN and create metadata
-// 2. Create replication slot immediately (to preserve WAL)
-// 3. Execute: Collect snapshot data
-// This ensures no WAL changes are lost during snapshot execution
+// prepareSnapshotAndSlot creates the replication slot before exporting and processing the snapshot.
 func (c *connector) prepareSnapshotAndSlot(ctx context.Context) error {
-	return c.retryOperation(ctx, "snapshot", 3, func(_ int) error {
-		if err := c.errIfStopped(ctx); err != nil {
-			return err
-		}
+	if err := c.errIfStopped(ctx); err != nil {
+		return err
+	}
 
-		// Phase 1: Create replication slot immediately (CRITICAL - preserves WAL)
-		slotInfo, err := c.slot.Create(ctx)
-		if err != nil {
-			return errors.Wrap(err, "create slot")
-		}
-		logger.Debug("replication slot created, WAL preserved", "slotName", slotInfo.Name, "restartLSN", slotInfo.RestartLSN.String())
+	slotInfo, err := c.slot.Create(ctx)
+	if err != nil {
+		return errors.Wrap(err, "create slot")
+	}
+	logger.Debug("replication slot created, WAL preserved", "slotName", slotInfo.Name, "restartLSN", slotInfo.RestartLSN.String())
 
-		// Phase 2: Prepare snapshot (capture LSN, create metadata, export snapshot)
-		err = c.snapshotter.Prepare(ctx, c.cfg.Slot.Name)
-		if err != nil {
-			return errors.Wrap(err, "prepare snapshot")
-		}
-		c.stream.OpenFromSnapshotLSN()
+	if err := c.executeSnapshotWithRetry(ctx, c.cfg.Slot.Name); err != nil {
+		return fmt.Errorf("run snapshot: %w", err)
+	}
 
-		// Phase 3: Execute snapshot (collect data from all chunks)
-		// This may fail if coordinator restarts during execution - retry with backoff
-		if err := c.executeSnapshotWithRetry(ctx); err != nil {
-			// Non-recoverable error
-			if c.isSnapshotInvalidationError(err) {
-				return errors.Wrap(err, "snapshot invalidated")
-			}
-			return errors.Wrap(err, "execute snapshot")
-		}
-
-		logger.Info("snapshot completed successfully")
-		return nil
-	})
+	logger.Info("snapshot completed successfully")
+	return nil
 }
 
 // executeSnapshotOnly executes snapshot without creating a replication slot
@@ -455,17 +497,8 @@ func (c *connector) executeSnapshotOnly(ctx context.Context) error {
 
 	logger.Info("starting snapshot-only execution", "slotName", slotName)
 
-	// Prepare snapshot (capture LSN, create metadata, export snapshot)
-	err := c.snapshotter.Prepare(ctx, slotName)
-	if err != nil {
-		return errors.Wrap(err, "prepare snapshot")
-	}
-
-	// Execute snapshot (collect data from all chunks)
-	// Note: We call Execute directly with the slotName we prepared with,
-	// not through executeSnapshotWithRetry which uses c.cfg.Slot.Name
-	if err := c.snapshotter.Execute(ctx, c.snapshotHandler, slotName); err != nil {
-		return errors.Wrap(err, "execute snapshot")
+	if err := c.executeSnapshotWithRetry(ctx, slotName); err != nil {
+		return fmt.Errorf("run snapshot: %w", err)
 	}
 
 	logger.Info("snapshot data collection completed")
@@ -484,111 +517,80 @@ func (c *connector) getSnapshotOnlySlotName() string {
 
 // shouldTakeSnapshotOnly checks if snapshot_only should run
 // Returns false if snapshot already completed (resume capability)
-func (c *connector) shouldTakeSnapshotOnly(ctx context.Context) bool {
+func (c *connector) shouldTakeSnapshotOnly(ctx context.Context) (bool, error) {
 	slotName := c.getSnapshotOnlySlotName()
+	if err := c.snapshotter.EnsureMetadataTables(ctx); err != nil {
+		return false, fmt.Errorf("initialize snapshot metadata: %w", err)
+	}
 
-	// If resnapshot is enabled, clean metadata for THIS slot only
 	if c.cfg.Snapshot.Resnapshot {
 		logger.Info("resnapshot enabled, cleaning metadata for slot", "slotName", slotName)
 		if err := c.snapshotter.CleanupJobForSlot(ctx, slotName); err != nil {
-			logger.Warn("failed to cleanup job for resnapshot", "error", err)
+			return false, errors.Wrap(err, "clean snapshot metadata")
 		}
-		return true
+		return true, nil
 	}
 
 	job, err := c.snapshotter.LoadJob(ctx, slotName)
 	if err != nil {
-		logger.Debug("failed to load snapshot job, will take snapshot", "error", err)
-		return true
+		return false, errors.Wrap(err, "load snapshot job")
 	}
-
-	// If job doesn't exist or not completed, take snapshot
 	if job == nil || !job.Completed {
-		return true
+		return true, nil
 	}
 
-	// Job exists and completed
 	logger.Info("snapshot-only already completed, skipping", "slotName", slotName)
-	return false
+	return false, nil
 }
 
-// executeSnapshotWithRetry executes snapshot with retry on coordinator failures
-// When coordinator restarts, it creates a new snapshot - workers should retry to join the new snapshot
-func (c *connector) executeSnapshotWithRetry(ctx context.Context) error {
+// executeSnapshotWithRetry retries only when the exported snapshot was invalidated.
+// Every retry prepares a fresh snapshot before replaying snapshot rows.
+func (c *connector) executeSnapshotWithRetry(ctx context.Context, slotName string) error {
 	const (
-		maxRetries        = 5
-		initialDelay      = 10 * time.Second
-		maxDelay          = 60 * time.Second
-		backoffMultiplier = 2
+		maxRetries   = 5
+		initialDelay = 10 * time.Second
+		maxDelay     = 60 * time.Second
 	)
 
 	retryDelay := initialDelay
-
-	for attempt := 1; attempt <= maxRetries; attempt++ {
-		err := c.snapshotter.Execute(ctx, c.snapshotHandler, c.cfg.Slot.Name)
+	for attempt := 1; ; attempt++ {
+		err := c.snapshotter.Prepare(ctx, slotName)
 		if err == nil {
-			return nil // Success
+			if !c.cfg.IsSnapshotOnlyMode() {
+				c.stream.OpenFromSnapshotLSN()
+			}
+			err = c.snapshotter.Execute(ctx, c.snapshotHandler(ctx), slotName)
 		}
-
-		// Check if this is a recoverable error (snapshot invalidation)
-		if !c.isSnapshotInvalidationError(err) {
-			// Non-recoverable error
+		if err == nil {
+			return nil
+		}
+		if !goerrors.Is(err, snapshot.ErrSnapshotInvalidated) {
 			return err
 		}
-
-		// Last attempt exhausted
-		if attempt >= maxRetries {
-			return errors.Wrap(err, "snapshot execution failed after maximum retries")
+		if attempt == maxRetries {
+			return fmt.Errorf("snapshot execution failed after maximum retries: %w", err)
 		}
 
-		// Log and wait before retry
-		c.logRetryAttempt(attempt, maxRetries, retryDelay)
-
-		if waitErr := c.waitWithContext(ctx, retryDelay); waitErr != nil {
-			return waitErr
+		logger.Warn("[snapshot] snapshot invalidated, retrying",
+			"slot", slotName,
+			"attempt", attempt,
+			"maxRetries", maxRetries,
+			"retryIn", retryDelay)
+		if err := c.waitWithContext(ctx, retryDelay); err != nil {
+			return err
 		}
-
-		// Exponential backoff
-		retryDelay = c.calculateNextDelay(retryDelay, maxDelay, backoffMultiplier)
+		retryDelay = min(retryDelay*2, maxDelay)
 	}
-
-	return errors.New("snapshot execution failed: unexpected exit from retry loop")
 }
 
-// isSnapshotInvalidationError checks if error is due to snapshot invalidation
-func (c *connector) isSnapshotInvalidationError(err error) bool {
-	if err == nil {
-		return false
-	}
-
-	// Check for typed error first (preferred)
-	if goerrors.Is(err, snapshot.ErrSnapshotInvalidated) {
-		return true
-	}
-
-	// Fallback to string matching for wrapped errors
-	return strings.Contains(err.Error(), "snapshot invalidated")
-}
-
-// logRetryAttempt logs snapshot retry attempt with context
-func (c *connector) logRetryAttempt(attempt, maxRetries int, delay time.Duration) {
-	logger.Warn("[snapshot] snapshot invalidated, coordinator likely restarted",
-		"attempt", attempt,
-		"maxRetries", maxRetries,
-		"waitTime", delay)
-
-	logger.Info("[snapshot] waiting for coordinator to create new snapshot",
-		"retryIn", delay)
-}
-
-// waitWithContext waits for duration or context cancellation
+// waitWithContext waits for duration or connector cancellation.
 func (c *connector) waitWithContext(ctx context.Context, duration time.Duration) error {
 	timer := time.NewTimer(duration)
 	defer timer.Stop()
 
 	select {
 	case <-ctx.Done():
-		return ctx.Err()
+		return context.Cause(ctx)
 	case <-c.stopCh:
 		return context.Canceled
 	case <-timer.C:
@@ -596,101 +598,89 @@ func (c *connector) waitWithContext(ctx context.Context, duration time.Duration)
 	}
 }
 
-// calculateNextDelay calculates next retry delay with exponential backoff
-func (c *connector) calculateNextDelay(currentDelay, maxDelay time.Duration, multiplier int) time.Duration {
-	nextDelay := currentDelay * time.Duration(multiplier)
-	if nextDelay > maxDelay {
-		return maxDelay
-	}
-	return nextDelay
-}
-
-// retryOperation executes an operation with retry logic.
-func (c *connector) retryOperation(ctx context.Context, operationName string, maxRetries int, operation func(attempt int) error) error {
-	var lastErr error
-	retryDelay := 5 * time.Second
-
-	for attempt := 1; attempt <= maxRetries; attempt++ {
-		if err := c.errIfStopped(ctx); err != nil {
+func (c *connector) snapshotHandler(ctx context.Context) snapshot.Handler {
+	return func(event *format.Snapshot) error {
+		if err := context.Cause(ctx); err != nil {
 			return err
 		}
-
-		if attempt > 1 {
-			logger.Info("retrying operation", "operation", operationName, "attempt", attempt, "maxRetries", maxRetries)
-		}
-
-		if err := operation(attempt); err != nil {
-			lastErr = err
-			logger.Warn("operation failed", "operation", operationName, "attempt", attempt, "error", err)
-
-			if attempt < maxRetries {
-				logger.Info("waiting before retry", "retryDelay", retryDelay.String())
-				if waitErr := c.waitWithContext(ctx, retryDelay); waitErr != nil {
-					return waitErr
-				}
-			}
-			continue
-		}
-
-		return nil
+		c.listenerFunc(&replication.ListenerContext{
+			Message: event,
+			Ack:     func() error { return nil },
+		})
+		return context.Cause(ctx)
 	}
-
-	return errors.Wrapf(lastErr, "%s failed after %d retries", operationName, maxRetries)
-}
-
-func (c *connector) snapshotHandler(event *format.Snapshot) error {
-	c.listenerFunc(&replication.ListenerContext{
-		Message: event,
-		Ack: func() error {
-			return nil // ACK isn't required for snapshot
-		},
-	})
-	return nil
 }
 
 func (c *connector) WaitUntilReady(ctx context.Context) error {
 	select {
 	case <-c.readyCh:
 		return nil
+	default:
+	}
+
+	select {
+	case <-c.readyCh:
+		return nil
 	case <-c.stopCh:
-		return context.Canceled
+		select {
+		case <-c.readyCh:
+			return nil
+		default:
+			return context.Canceled
+		}
 	case <-ctx.Done():
-		return ctx.Err()
+		select {
+		case <-c.readyCh:
+			return nil
+		default:
+			return context.Cause(ctx)
+		}
 	}
 }
 
 func (c *connector) Close() {
-	c.closeOnce.Do(func() {
-		// Create a context with timeout for graceful cleanup.
-		// 30 seconds should be sufficient for closing connections and cleanup operations.
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	c.stopOnce.Do(func() { close(c.stopCh) })
+
+	c.runMu.Lock()
+	runCancel := c.runCancel
+	runDone := c.runDone
+	c.runMu.Unlock()
+	if runCancel != nil {
+		runCancel(context.Canceled)
+	}
+	if runDone != nil {
+		select {
+		case <-runDone:
+		case <-time.After(connectorShutdownTimeout):
+			logger.Warn("timed out waiting for connector shutdown")
+		}
+		return
+	}
+	c.cleanup()
+}
+
+func (c *connector) cleanup() {
+	c.cleanupOnce.Do(func() {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), connectorShutdownTimeout)
 		defer cancel()
 
 		logger.Debug("[connector] closing connector")
-
-		close(c.stopCh)
-		signal.Stop(c.cancelCh)
-
-		// Close snapshotter connections if still open (fallback for crash/error scenarios)
-		// Normal flow: connections are already closed in finalizeSnapshot() when snapshot completes
-		if c.snapshotter != nil {
-			c.snapshotter.Close(ctx)
+		if c.stream != nil {
+			c.stream.Close(cleanupCtx)
 		}
-
-		// Close replication slot and stream (nil in snapshot_only mode)
-		if c.slot != nil {
-			c.slot.Close(ctx)
+		if c.snapshotter != nil {
+			c.snapshotter.Close(cleanupCtx)
 		}
 		if c.heartbeat != nil {
-			c.heartbeat.Close(ctx)
+			c.heartbeat.Close(cleanupCtx)
 		}
-		if c.stream != nil {
-			c.stream.Close(ctx)
+		if c.timescaleDB != nil {
+			c.timescaleDB.Close(cleanupCtx)
 		}
-
-		// Shutdown HTTP server
+		if c.slot != nil {
+			c.slot.Close(cleanupCtx)
+		}
 		c.server.Shutdown()
-
 		logger.Info("[connector] connector closed successfully")
 	})
 }
@@ -705,34 +695,23 @@ func (c *connector) SetMetricCollectors(metricCollectors ...prometheus.Collector
 
 func (c *connector) CaptureSlot(ctx context.Context) error {
 	logger.Info("slot capturing...")
-	ticker := time.NewTicker(time.Second)
-	defer ticker.Stop()
 	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-c.stopCh:
-			return context.Canceled
-		case <-ticker.C:
-		}
-
 		info, err := c.slot.Info(ctx)
+		if err == nil && !info.Active {
+			logger.Debug("capture slot", "slotInfo", info)
+			return nil
+		}
 		if err != nil {
 			if ctx.Err() != nil {
-				return ctx.Err()
+				return context.Cause(ctx)
 			}
 			if goerrors.Is(err, slot.ErrorSlotClosed) {
 				return nil
 			}
 			logger.Warn("slot info failed on capture slot", "error", err)
-			continue
 		}
-
-		if info.Active {
-			continue
+		if err := c.waitWithContext(ctx, time.Second); err != nil {
+			return err
 		}
-
-		logger.Debug("capture slot", "slotInfo", info)
-		return nil
 	}
 }

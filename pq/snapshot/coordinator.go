@@ -346,6 +346,12 @@ func (s *Snapshotter) initTables(ctx context.Context) error {
 	return nil
 }
 
+// EnsureMetadataTables creates or migrates snapshot metadata before callers
+// inspect whether a job already exists.
+func (s *Snapshotter) EnsureMetadataTables(ctx context.Context) error {
+	return s.initTables(ctx)
+}
+
 // migrateSchema applies idempotent schema migrations to ensure backward compatibility
 // This allows seamless upgrades when new columns are added to metadata tables
 func (s *Snapshotter) migrateSchema(ctx context.Context) {
@@ -443,12 +449,16 @@ func (s *Snapshotter) processChunk(ctx context.Context, conn pq.Connection, chun
 
 	// Process each row
 	for i, row := range result.Rows {
+		if err := context.Cause(ctx); err != nil {
+			return 0, err
+		}
 		rowData := s.parseRow(result.FieldDescriptions, row)
 
 		isLast := (i == len(result.Rows)-1) && (rowCount < chunk.ChunkSize)
 
-		// Send data event
-		_ = handler(&format.Snapshot{
+		// Send data event. A failed handler must leave the chunk incomplete so it
+		// can be delivered again after the caller recovers.
+		if err := handler(&format.Snapshot{
 			EventType:  format.SnapshotEventTypeData,
 			Table:      chunk.TableName,
 			Schema:     chunk.TableSchema,
@@ -456,7 +466,9 @@ func (s *Snapshotter) processChunk(ctx context.Context, conn pq.Connection, chun
 			ServerTime: chunkTime,
 			LSN:        lsn,
 			IsLast:     isLast,
-		})
+		}); err != nil {
+			return 0, errors.Wrap(err, "handle snapshot row")
+		}
 	}
 
 	return rowCount, nil

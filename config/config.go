@@ -398,6 +398,9 @@ func (s *SnapshotConfig) Validate() error {
 	if s.HeartbeatInterval <= 0 {
 		return errors.New("snapshot heartbeat interval must be greater than 0")
 	}
+	if s.HeartbeatInterval > s.ClaimTimeout/2 {
+		return errors.New("snapshot heartbeat interval must not exceed half the claim timeout")
+	}
 
 	// For snapshot_only mode, tables must be specified
 	if s.Mode == SnapshotModeSnapshotOnly && len(s.Tables) == 0 {

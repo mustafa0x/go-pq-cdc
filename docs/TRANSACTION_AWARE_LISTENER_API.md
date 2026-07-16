@@ -1,131 +1,113 @@
-# Transaction-Aware Listener Metadata API
+# Transaction-Aware Listener API
 
-## Summary
+## Purpose
 
-`go-pq-cdc` works well for row-oriented consumers, but some consumers need a stronger listener contract: they need to project a full committed PostgreSQL transaction atomically, persist the commit/checkpoint LSN, and only acknowledge replication after their projection is durable.
+Transaction-aware mode lets a consumer project each committed PostgreSQL transaction atomically, persist its commit LSN, and acknowledge replication only after that projection is durable.
 
-This proposal adds an opt-in transaction-aware listener mode that exposes WAL metadata and transaction boundary events to the listener.
+The mode is opt-in. The default listener remains row-oriented.
 
-The default row-oriented behavior should remain unchanged for existing users.
-
-## Problem
-
-The current listener callback receives decoded messages and an `Ack` function. For transactional projectors, that is not enough.
-
-A consumer that maintains a derived read model or sync log often needs to:
-
-- group all row changes from one PostgreSQL transaction
-- apply those changes atomically to its own tables
-- store the transaction commit LSN as an idempotency/checkpoint key
-- call `Ack()` only after the whole projected transaction commits
-- avoid acknowledging partial transaction state
-
-Without explicit transaction boundary events, the consumer cannot reliably know when to flush an accumulated transaction. Without exposed WAL metadata, it also cannot persist the exact source position associated with a row or commit.
-
-This is generic CDC behavior, not application-specific mapping logic.
-
-## Proposed API
-
-Add WAL metadata to listener contexts:
-
-```go
-type ListenerContext struct {
-	Message any
-	Ack     func() error
-
-	// WALStart is the WAL start position for this decoded logical message.
-	WALStart pq.LSN
-
-	// AckLSN is the exact LSN that Ack will confirm.
-	// For commit events this should be the transaction end LSN.
-	AckLSN pq.LSN
-}
-```
-
-Add an opt-in config flag:
+## Configuration
 
 ```go
 type ListenerConfig struct {
-	EmitTransactionBoundaries bool `json:"emitTransactionBoundaries" yaml:"emitTransactionBoundaries"`
+    EmitTransactionBoundaries bool `json:"emitTransactionBoundaries" yaml:"emitTransactionBoundaries"`
 }
 ```
 
-When `EmitTransactionBoundaries` is false, behavior remains row-oriented.
+## Listener metadata
 
-When `EmitTransactionBoundaries` is true, the listener receives:
+```go
+type ListenerContext struct {
+    Message any
 
-- `*format.Begin`
-- row messages: `*format.Insert`, `*format.Update`, `*format.Delete`
-- `*format.Commit`
-- buffered streamed transaction rows followed by `*format.StreamCommit`
-- snapshot events as they work today
+    // WALStart is the WAL start position of this decoded message.
+    WALStart pq.LSN
 
-## Semantics
+    // AckLSN is the checkpoint associated with this message. In
+    // transaction-aware mode, only Commit and StreamCommit acknowledgements
+    // advance confirmed_flush_lsn.
+    AckLSN pq.LSN
 
-For regular transactions:
+    Ack func() error
+}
+```
 
-1. Emit `Begin`.
-2. Emit row events in WAL/order-preserving order.
-3. Emit `Commit`.
-4. `Commit.Ack()` confirms the transaction end LSN.
+## Delivery contract
 
-For streamed transactions:
+For a regular transaction the listener receives, in WAL order:
 
-1. Do not emit rows before the streamed transaction commits.
-2. Buffer streamed rows by XID as today.
-3. On `StreamCommit`, emit the buffered rows in order.
-4. Emit `StreamCommit`.
-5. `StreamCommit.Ack()` confirms the transaction end LSN.
-6. On `StreamAbort`, discard buffered rows and emit nothing.
+1. `*format.Begin`
+2. decoded row and metadata messages emitted by PostgreSQL
+3. `*format.Commit`
 
-For rollbacks:
+For a streamed transaction, messages are buffered by XID and are not delivered until PostgreSQL emits `StreamCommit`. The buffered messages are then delivered in order, followed by `*format.StreamCommit`. `StreamAbort` discards the buffered transaction.
 
-- no committed row events should be emitted
-- no commit boundary should be emitted
+Rolled-back transactions do not produce a commit boundary.
 
-## Why This Matters
+Malformed or unsupported replication messages terminate the stream. They are not skipped, because skipping a row and later acknowledging its commit would make a partial projection durable.
 
-This enables downstream systems to implement correct transactional projection:
+## Acknowledgement contract
+
+When transaction-aware mode is disabled, `Ack()` keeps the existing row-oriented behavior.
+
+When transaction-aware mode is enabled:
+
+- `Ack()` on `Commit` and `StreamCommit` marks that transaction checkpoint durable.
+- Commit acknowledgements are ordered. A later acknowledged commit cannot advance `confirmed_flush_lsn` past an earlier unacknowledged commit.
+- `Ack()` on rows and metadata does not advance the confirmed LSN. Replication feedback remains coalesced by the stream loop.
+- `AckLSN` on a commit boundary equals the PostgreSQL transaction-end LSN.
+
+PostgreSQL replication acknowledgements are cumulative. A consumer must stop or cancel the connector after a projection or acknowledgement failure; it must not continue projecting later commits after an earlier commit failed.
+
+Heartbeat rows are filtered before listener delivery. In transaction-aware mode, any visible transaction boundary around a heartbeat transaction must still be acknowledged.
+
+## Projection pattern
 
 ```go
 func listener(ctx *replication.ListenerContext) {
-	switch msg := ctx.Message.(type) {
-	case *format.Begin:
-		txBuffer.Begin(msg.Xid)
+    switch msg := ctx.Message.(type) {
+    case *format.Begin:
+        txBuffer.Begin(msg.Xid)
 
-	case *format.Insert, *format.Update, *format.Delete:
-		txBuffer.Append(ctx.WALStart, msg)
+    case *format.Insert, *format.Update, *format.Delete:
+        txBuffer.Append(ctx.WALStart, msg)
 
-	case *format.Commit:
-		if err := projector.Apply(txBuffer.Rows(), msg.TransactionEndLSN); err != nil {
-			return
-		}
-		_ = ctx.Ack()
-	}
+    case *format.Commit:
+        if err := projector.Apply(txBuffer.Rows(), ctx.AckLSN); err != nil {
+            cancel(err)
+            return
+        }
+        if err := ctx.Ack(); err != nil {
+            cancel(err)
+        }
+    }
 }
 ```
 
-The important property is that replication is acknowledged only after the consumer has durably applied the full source transaction.
+The projection transaction must commit before `Ack()` is called.
 
-## Non-Goals
+## Lifecycle
 
-This proposal does not add application schema mapping, YAML sync schemas, ORM concepts, or domain-specific projection logic. Those should remain outside `go-pq-cdc`.
+`Connector.Start` owns connector cleanup and returns startup and runtime errors. `WaitUntilReady` is a monotonic broadcast: once readiness is reached, all current and future waiters observe it, including after shutdown.
 
-It also does not require changing the existing row-oriented listener behavior.
+```go
+startResult := make(chan error, 1)
+go func() {
+    startResult <- connector.Start(ctx)
+}()
 
-## Test Coverage
+readyErr := connector.WaitUntilReady(ctx)
+if readyErr == nil {
+    onReady()
+}
+if startErr := <-startResult; startErr != nil {
+    return startErr
+}
+return readyErr
+```
 
-Suggested tests:
-
-- default mode does not emit transaction boundary messages
-- transaction mode emits `Begin -> rows -> Commit`
-- `Commit` context has `AckLSN == TransactionEndLSN`
-- multi-row transactions preserve row order
-- streamed transactions emit no rows before `StreamCommit`
-- `StreamAbort` discards buffered rows
-- listener can delay `Ack()` until after commit projection
-- sink shutdown closes/stops processor cleanly without blocking
+A connector instance is one-shot. Create a new connector to restart it.
 
 ## Compatibility
 
-This can be introduced as an opt-in feature. Existing users that only handle row messages can keep the current default behavior. Transactional consumers get a stable API instead of relying on internal buffering details.
+Existing row-oriented consumers do not need to enable transaction boundaries. Transactional consumers receive an explicit transaction envelope and a checkpoint contract without depending on internal buffering details.

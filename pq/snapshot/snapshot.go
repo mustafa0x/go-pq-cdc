@@ -35,7 +35,7 @@ type Snapshotter struct {
 	keepaliveCancel    context.CancelFunc
 	typeMap            *pgtype.Map
 	decoderCache       *DecoderCache
-	connectionPool     *ConnectionPool
+	workerConn         pq.Connection
 	orderByCache       map[string]orderByCacheEntry
 	keepaliveDone      chan struct{}
 	dsn                string
@@ -44,6 +44,7 @@ type Snapshotter struct {
 	config             config.SnapshotConfig
 	orderByMu          sync.RWMutex
 	keepaliveMu        sync.Mutex
+	closeOnce          sync.Once
 	exportConnClosed   bool
 }
 
@@ -53,37 +54,35 @@ type orderByCacheEntry struct {
 }
 
 func New(ctx context.Context, snapshotConfig config.SnapshotConfig, tables publication.Tables, dsn string, m metric.Metric) (*Snapshotter, error) {
-	metadataConn, err := pq.NewConnection(ctx, dsn)
+	snapshotter := &Snapshotter{
+		dsn:          dsn,
+		decoderCache: NewDecoderCache(),
+		config:       snapshotConfig,
+		tables:       tables,
+		typeMap:      pgtype.NewMap(),
+		metric:       m,
+		orderByCache: make(map[string]orderByCacheEntry),
+	}
+
+	var err error
+	snapshotter.metadataConn, err = pq.NewConnection(ctx, dsn)
 	if err != nil {
 		return nil, errors.Wrap(err, "create metadata connection")
 	}
 
-	healthcheckConn, err := pq.NewConnection(ctx, dsn)
+	snapshotter.healthcheckConn, err = pq.NewConnection(ctx, dsn)
 	if err != nil {
+		snapshotter.Close(ctx)
 		return nil, errors.Wrap(err, "create healthcheck connection")
 	}
 
-	// Create connection pool for chunk processing (5 connections)
-	connectionPool, err := NewConnectionPool(ctx, dsn, 5)
+	snapshotter.workerConn, err = pq.NewConnection(ctx, dsn)
 	if err != nil {
-		return nil, errors.Wrap(err, "create connection pool")
+		snapshotter.Close(ctx)
+		return nil, errors.Wrap(err, "create worker connection")
 	}
 
-	// Create decoder cache for efficient type decoding
-	decoderCache := NewDecoderCache()
-
-	return &Snapshotter{
-		dsn:             dsn,
-		metadataConn:    metadataConn,
-		healthcheckConn: healthcheckConn,
-		connectionPool:  connectionPool,
-		decoderCache:    decoderCache,
-		config:          snapshotConfig,
-		tables:          tables,
-		typeMap:         pgtype.NewMap(),
-		metric:          m,
-		orderByCache:    make(map[string]orderByCacheEntry),
-	}, nil
+	return snapshotter, nil
 }
 
 // Prepare sets up snapshot metadata and exports snapshot transaction
@@ -130,7 +129,7 @@ func (s *Snapshotter) Execute(ctx context.Context, handler Handler, slotName str
 
 	// Execute worker processing (ALL instances work, including coordinator)
 	if err := s.executeWorker(ctx, slotName, instanceID, job, handler, startTime); err != nil {
-		return errors.Wrap(err, "execute worker")
+		return fmt.Errorf("execute worker: %w", err)
 	}
 
 	// Finalize (check completion, send END marker)
@@ -144,79 +143,48 @@ func (s *Snapshotter) Execute(ctx context.Context, handler Handler, slotName str
 
 // finalizeSnapshot checks completion, closes connections, and sends END marker
 func (s *Snapshotter) finalizeSnapshot(ctx context.Context, slotName string, job *Job, handler Handler) error {
-	allCompleted, err := s.checkJobCompleted(ctx, slotName)
+	completed, err := s.checkJobCompleted(ctx, slotName)
 	if err != nil {
 		return errors.Wrap(err, "check job completed")
 	}
-
-	if !allCompleted {
-		return nil // Not done yet, keep processing
-	}
-
-	logger.Info("[snapshot] all chunks completed, finalizing snapshot")
-
-	// Mark job as completed (idempotent - safe for multiple workers)
-	if err := s.markJobAsCompleted(ctx, slotName); err != nil {
-		logger.Warn("[snapshot] failed to mark job as completed", "error", err)
-		return err
-	}
-
-	shouldEmitEnd, err := s.markSnapshotEndEmitted(ctx, slotName)
-	if err != nil {
-		return errors.Wrap(err, "mark snapshot end emitted")
-	}
-	defer s.closeAllConnections(ctx, true)
-	if !shouldEmitEnd {
+	if !completed {
 		return nil
 	}
 
-	// Send END marker once per snapshot job. Multiple workers may reach
-	// finalization concurrently, so marker emission is gated by metadata.
-	if err := handler(&format.Snapshot{
-		EventType:  format.SnapshotEventTypeEnd,
-		ServerTime: time.Now().UTC(),
-		LSN:        job.SnapshotLSN,
-	}); err != nil {
-		return errors.Wrap(err, "handle snapshot end")
-	}
-	return nil
+	logger.Info("[snapshot] all chunks completed, finalizing snapshot")
+	defer s.closeAllConnections(ctx)
+	return s.emitSnapshotMarker(ctx, slotName, format.SnapshotEventTypeEnd, job.SnapshotLSN, handler)
 }
 
-// closeAllConnections closes all snapshot connections
-// commitExport: if true, commits the export snapshot transaction; if false, rolls it back
-func (s *Snapshotter) closeAllConnections(ctx context.Context, commitExport bool) {
-	logger.Info("[snapshot] closing all connections")
+// closeAllConnections closes every connection owned by the snapshotter.
+func (s *Snapshotter) closeAllConnections(context.Context) {
+	s.closeOnce.Do(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
 
-	// Close export snapshot connection (coordinator only)
-	s.closeExportSnapshotConnection(ctx, commitExport)
-
-	// Close connection pool
-	if s.connectionPool != nil {
-		s.connectionPool.Close(ctx)
-		s.connectionPool = nil
-	}
-
-	// Close metadata connection
-	if s.metadataConn != nil {
-		if err := s.metadataConn.Close(ctx); err != nil {
-			logger.Warn("[snapshot] error closing metadata connection", "error", err)
+		logger.Info("[snapshot] closing all connections")
+		s.closeExportSnapshotConnection(ctx)
+		connections := []struct {
+			name string
+			conn pq.Connection
+		}{
+			{"worker", s.workerConn},
+			{"metadata", s.metadataConn},
+			{"healthcheck", s.healthcheckConn},
 		}
-		s.metadataConn = nil
-	}
-
-	// Close healthcheck connection
-	if s.healthcheckConn != nil {
-		if err := s.healthcheckConn.Close(ctx); err != nil {
-			logger.Warn("[snapshot] error closing healthcheck connection", "error", err)
+		for _, connection := range connections {
+			if connection.conn != nil {
+				if err := connection.conn.Close(ctx); err != nil {
+					logger.Warn("[snapshot] error closing connection", "connection", connection.name, "error", err)
+				}
+			}
 		}
-		s.healthcheckConn = nil
-	}
-
-	logger.Info("[snapshot] all connections closed")
+		logger.Info("[snapshot] all connections closed")
+	})
 }
 
-// closeExportSnapshotConnection commits or rolls back and closes the export snapshot connection
-func (s *Snapshotter) closeExportSnapshotConnection(ctx context.Context, commit bool) {
+// closeExportSnapshotConnection rolls back the read-only exported transaction and closes it.
+func (s *Snapshotter) closeExportSnapshotConnection(ctx context.Context) {
 	s.stopSnapshotKeepalive()
 
 	s.keepaliveMu.Lock()
@@ -227,44 +195,23 @@ func (s *Snapshotter) closeExportSnapshotConnection(ctx context.Context, commit 
 	s.exportConnClosed = true
 	exportConn := s.exportSnapshotConn
 	s.keepaliveMu.Unlock()
-
 	if exportConn == nil {
 		return
 	}
 
-	if commit {
-		logger.Info("[coordinator] committing and closing snapshot export connection")
-		if err := s.execSQL(ctx, exportConn, "COMMIT"); err != nil {
-			logger.Warn("[coordinator] failed to commit snapshot transaction, attempting rollback", "error", err)
-			if rollbackErr := s.execSQL(ctx, exportConn, "ROLLBACK"); rollbackErr != nil {
-				logger.Error("[coordinator] failed to rollback snapshot transaction", "error", rollbackErr)
-			}
-		}
-	} else {
-		logger.Info("[coordinator] rolling back and closing snapshot export connection")
-		if err := s.execSQL(ctx, exportConn, "ROLLBACK"); err != nil {
-			logger.Warn("[coordinator] failed to rollback snapshot transaction", "error", err)
-		}
+	if err := s.execSQL(ctx, exportConn, "ROLLBACK"); err != nil {
+		logger.Warn("[coordinator] failed to rollback snapshot transaction", "error", err)
 	}
-
 	if err := exportConn.Close(ctx); err != nil {
 		logger.Warn("[coordinator] error closing export snapshot connection", "error", err)
 	}
-
-	s.keepaliveMu.Lock()
-	s.exportSnapshotConn = nil
-	s.keepaliveMu.Unlock()
 }
 
-// Close closes all connections held by the Snapshotter
-// Safe to call multiple times (idempotent)
-// This is a fallback for cleanup in case snapshot doesn't complete normally
+// Close releases every resource owned by the snapshotter.
 func (s *Snapshotter) Close(ctx context.Context) {
-	if s == nil {
-		return
+	if s != nil {
+		s.closeAllConnections(ctx)
 	}
-	logger.Debug("[snapshot] closing snapshotter (fallback cleanup)")
-	s.closeAllConnections(ctx, false) // Rollback on abnormal termination
 }
 
 func (s *Snapshotter) startSnapshotKeepalive(parentCtx context.Context, conn pq.Connection) {
