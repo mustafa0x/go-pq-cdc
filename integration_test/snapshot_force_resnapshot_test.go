@@ -3,6 +3,7 @@ package integration
 import (
 	"context"
 	"fmt"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -166,6 +167,7 @@ func TestForceResnapshotCleansMetadataAndReprocesses(t *testing.T) {
 
 	cdcCfg3 := cdcCfg
 	cdcCfg3.Snapshot.Resnapshot = true // Force resnapshot!
+	cdcCfg3.Snapshot.ResnapshotID = "add-diana-and-eve"
 
 	thirdSnapshotData := []map[string]any{}
 	thirdSnapshotComplete := false
@@ -226,6 +228,54 @@ func TestForceResnapshotCleansMetadataAndReprocesses(t *testing.T) {
 		completed := string(results[0].Rows[0][0]) == "t"
 		assert.True(t, completed, "New job should be marked as completed")
 	})
+
+	results, err = execQuery(ctx, postgresConn, fmt.Sprintf("SELECT snapshot_id FROM cdc_snapshot_job WHERE slot_name = '%s'", slotName))
+	require.NoError(t, err)
+	generationID := string(results[0].Rows[0][0])
+
+	var repeatedSnapshot atomic.Bool
+	connector4, err := cdc.NewConnector(ctx, cdcCfg3, func(ctx *replication.ListenerContext) {
+		if msg, ok := ctx.Message.(*format.Snapshot); ok && msg.EventType == format.SnapshotEventTypeBegin {
+			repeatedSnapshot.Store(true)
+		}
+		_ = ctx.Ack()
+	})
+	require.NoError(t, err)
+	go connector4.Start(ctx)
+
+	waitCtx4, cancel4 := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel4()
+	require.NoError(t, connector4.WaitUntilReady(waitCtx4))
+	connector4.Close()
+
+	assert.False(t, repeatedSnapshot.Load(), "late instance from the same resnapshot deployment should join the completed generation")
+	results, err = execQuery(ctx, postgresConn, fmt.Sprintf("SELECT snapshot_id FROM cdc_snapshot_job WHERE slot_name = '%s'", slotName))
+	require.NoError(t, err)
+	assert.Equal(t, generationID, string(results[0].Rows[0][0]), "late instance should preserve the completed generation")
+
+	require.NoError(t, pgExec(ctx, postgresConn, fmt.Sprintf(
+		"UPDATE cdc_snapshot_job SET resnapshot_id = 'later-request', completed = false, begin_emitted = false, end_emitted = false WHERE slot_name = '%s'",
+		slotName,
+	)))
+	var replayedOldRequest atomic.Bool
+	connector5, err := cdc.NewConnector(ctx, cdcCfg3, func(ctx *replication.ListenerContext) {
+		if msg, ok := ctx.Message.(*format.Snapshot); ok && msg.EventType == format.SnapshotEventTypeBegin {
+			replayedOldRequest.Store(true)
+		}
+		_ = ctx.Ack()
+	})
+	require.NoError(t, err)
+	go connector5.Start(ctx)
+
+	waitCtx5, cancel5 := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel5()
+	require.NoError(t, connector5.WaitUntilReady(waitCtx5))
+	connector5.Close()
+
+	assert.False(t, replayedOldRequest.Load(), "a consumed resnapshot request should not replace a newer generation")
+	results, err = execQuery(ctx, postgresConn, fmt.Sprintf("SELECT resnapshot_id FROM cdc_snapshot_job WHERE slot_name = '%s'", slotName))
+	require.NoError(t, err)
+	assert.Equal(t, "later-request", string(results[0].Rows[0][0]), "late old request should preserve the newer generation")
 }
 
 // TestForceResnapshotOnlyMode tests resnapshot with snapshot_only mode
@@ -309,6 +359,7 @@ func TestForceResnapshotOnlyMode(t *testing.T) {
 
 	cdcCfg2 := cdcCfg
 	cdcCfg2.Snapshot.Resnapshot = true
+	cdcCfg2.Snapshot.ResnapshotID = "snapshot-only-refresh"
 
 	secondCount := 0
 	secondComplete := false
@@ -435,6 +486,7 @@ func TestForceResnapshotDoesNotAffectOtherSlots(t *testing.T) {
 	cfg.Snapshot.Mode = config.SnapshotModeInitial
 	cfg.Snapshot.ChunkSize = 100
 	cfg.Snapshot.Resnapshot = true // Force!
+	cfg.Snapshot.ResnapshotID = "slot-one-refresh"
 
 	complete := false
 	connector, err := cdc.NewConnector(ctx, cfg, func(ctx *replication.ListenerContext) {

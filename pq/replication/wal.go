@@ -2,9 +2,8 @@ package replication
 
 import (
 	"encoding/binary"
+	"fmt"
 	"time"
-
-	"github.com/go-playground/errors"
 
 	"github.com/Trendyol/go-pq-cdc/pq"
 )
@@ -22,7 +21,7 @@ type XLogData struct {
 func ParseXLogData(buf []byte) (XLogData, error) {
 	var xld XLogData
 	if len(buf) < 24 {
-		return xld, errors.Newf("XLogData must be at least 24 bytes, got %d", len(buf))
+		return xld, fmt.Errorf("XLogData must be at least 24 bytes, got %d", len(buf))
 	}
 
 	xld.WALStart = pq.LSN(binary.BigEndian.Uint64(buf))

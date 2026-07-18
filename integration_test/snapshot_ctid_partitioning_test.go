@@ -36,7 +36,7 @@ func TestSnapshotCTIDPartitioning(t *testing.T) {
 	cdcCfg.Snapshot.Enabled = true
 	cdcCfg.Snapshot.Mode = "initial"
 	cdcCfg.Snapshot.ChunkSize = 50 // Small chunk size to create multiple chunks
-	cdcCfg.Snapshot.HeartbeatInterval = 30 * time.Second
+	cdcCfg.Snapshot.HeartbeatInterval = 10 * time.Second
 	cdcCfg.Snapshot.ClaimTimeout = 30 * time.Second
 
 	postgresConn, err := newPostgresConn()
@@ -238,7 +238,7 @@ func TestSnapshotCTIDVsOffset(t *testing.T) {
 	cdcCfg.Snapshot.Enabled = true
 	cdcCfg.Snapshot.Mode = "initial"
 	cdcCfg.Snapshot.ChunkSize = 30
-	cdcCfg.Snapshot.HeartbeatInterval = 30 * time.Second
+	cdcCfg.Snapshot.HeartbeatInterval = 10 * time.Second
 	cdcCfg.Snapshot.ClaimTimeout = 30 * time.Second
 
 	postgresConn, err := newPostgresConn()
@@ -358,7 +358,7 @@ func TestSnapshotIntegerPKStillUsesRange(t *testing.T) {
 	cdcCfg.Snapshot.Enabled = true
 	cdcCfg.Snapshot.Mode = "initial"
 	cdcCfg.Snapshot.ChunkSize = 25
-	cdcCfg.Snapshot.HeartbeatInterval = 30 * time.Second
+	cdcCfg.Snapshot.HeartbeatInterval = 10 * time.Second
 	cdcCfg.Snapshot.ClaimTimeout = 30 * time.Second
 
 	postgresConn, err := newPostgresConn()
@@ -482,7 +482,7 @@ func TestSnapshotExplicitCTIDOverride(t *testing.T) {
 	cdcCfg.Snapshot.Enabled = true
 	cdcCfg.Snapshot.Mode = "initial"
 	cdcCfg.Snapshot.ChunkSize = 25
-	cdcCfg.Snapshot.HeartbeatInterval = 30 * time.Second
+	cdcCfg.Snapshot.HeartbeatInterval = 10 * time.Second
 	cdcCfg.Snapshot.ClaimTimeout = 30 * time.Second
 
 	postgresConn, err := newPostgresConn()
@@ -626,7 +626,7 @@ func TestSnapshotExplicitOffsetStrategy(t *testing.T) {
 	cdcCfg.Snapshot.Enabled = true
 	cdcCfg.Snapshot.Mode = "initial"
 	cdcCfg.Snapshot.ChunkSize = 25
-	cdcCfg.Snapshot.HeartbeatInterval = 30 * time.Second
+	cdcCfg.Snapshot.HeartbeatInterval = 10 * time.Second
 	cdcCfg.Snapshot.ClaimTimeout = 30 * time.Second
 
 	postgresConn, err := newPostgresConn()
@@ -727,7 +727,7 @@ func TestSnapshotCTIDConsistency(t *testing.T) {
 	cdcCfg.Snapshot.Enabled = true
 	cdcCfg.Snapshot.Mode = "initial"
 	cdcCfg.Snapshot.ChunkSize = 100
-	cdcCfg.Snapshot.HeartbeatInterval = 30 * time.Second
+	cdcCfg.Snapshot.HeartbeatInterval = 10 * time.Second
 	cdcCfg.Snapshot.ClaimTimeout = 30 * time.Second
 
 	postgresConn, err := newPostgresConn()
@@ -901,7 +901,7 @@ func TestSnapshotCTIDNoDataLoss(t *testing.T) {
 	cdcCfg.Snapshot.Enabled = true
 	cdcCfg.Snapshot.Mode = "initial"
 	cdcCfg.Snapshot.ChunkSize = 50 // Small chunk to create multiple chunks
-	cdcCfg.Snapshot.HeartbeatInterval = 30 * time.Second
+	cdcCfg.Snapshot.HeartbeatInterval = 10 * time.Second
 	cdcCfg.Snapshot.ClaimTimeout = 30 * time.Second
 
 	postgresConn, err := newPostgresConn()

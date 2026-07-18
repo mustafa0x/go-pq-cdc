@@ -55,6 +55,7 @@ When transaction-aware mode is enabled:
 - `Ack()` on `Commit` and `StreamCommit` marks that transaction checkpoint durable.
 - Commit acknowledgements are ordered. A later acknowledged commit cannot advance `confirmed_flush_lsn` past an earlier unacknowledged commit.
 - `Ack()` on rows and metadata does not advance the confirmed LSN. Replication feedback remains coalesced by the stream loop.
+- Feedback writes are owned by the stream sink. A socket-write failure terminates the stream and is returned from `Connector.Start`; it is not reported synchronously by `Ack()`.
 - `AckLSN` on a commit boundary equals the PostgreSQL transaction-end LSN.
 
 PostgreSQL replication acknowledgements are cumulative. A consumer must stop or cancel the connector after a projection or acknowledgement failure; it must not continue projecting later commits after an earlier commit failed.

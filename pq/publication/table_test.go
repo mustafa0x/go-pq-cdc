@@ -111,3 +111,15 @@ func TestTablesContains(t *testing.T) {
 	assert.True(t, tables.Contains("tenant_a", "events"))
 	assert.False(t, tables.Contains("public", "orders"))
 }
+
+func TestTableValidateRejectsUnknownSnapshotPartitionStrategy(t *testing.T) {
+	table := Table{
+		Name:                      "books",
+		ReplicaIdentity:           ReplicaIdentityDefault,
+		SnapshotPartitionStrategy: SnapshotPartitionStrategy("mystery"),
+	}
+
+	err := table.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "undefined snapshot partition strategy")
+}

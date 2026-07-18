@@ -5,7 +5,9 @@ import (
 
 	"github.com/Trendyol/go-pq-cdc/config"
 	"github.com/Trendyol/go-pq-cdc/pq/publication"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func ptrInt64(v int64) *int64 { return &v }
@@ -90,37 +92,44 @@ func TestGetQueryCondition(t *testing.T) {
 	})
 }
 
+func requireChunkQuery(t *testing.T, s *Snapshotter, chunk *Chunk, orderBy string, pkColumns []string, condition string) string {
+	t.Helper()
+	query, err := s.buildChunkQuery(chunk, orderBy, pkColumns, condition)
+	require.NoError(t, err)
+	return query
+}
+
 func TestBuildChunkQueryWithCondition(t *testing.T) {
 	s := &Snapshotter{}
 
-	t.Run("integer range injects condition into WHERE", func(t *testing.T) {
+	t.Run("integer range injects condition", func(t *testing.T) {
 		chunk := &Chunk{
 			TableSchema:       "public",
 			TableName:         "users",
 			PartitionStrategy: PartitionStrategyIntegerRange,
 			RangeStart:        ptrInt64(1),
-			RangeEnd:          ptrInt64(1000),
+			RangeEnd:          ptrInt64(500),
 			ChunkSize:         500,
 		}
-		q := s.buildChunkQuery(chunk, "id", []string{"id"}, "is_active = true")
-		assert.Contains(t, q, `WHERE "id" >= 1 AND "id" <= 1000 AND (is_active = true)`)
-		assert.Contains(t, q, "ORDER BY id LIMIT 500")
+		query := requireChunkQuery(t, s, chunk, "id", []string{"id"}, "is_active = true")
+		assert.Contains(t, query, `WHERE "id" >= 1 AND "id" <= 500 AND (is_active = true)`)
+		assert.Contains(t, query, "ORDER BY id LIMIT 500")
 	})
 
-	t.Run("integer range without condition quotes identifiers", func(t *testing.T) {
+	t.Run("integer range quotes identifiers", func(t *testing.T) {
 		chunk := &Chunk{
 			TableSchema:       "public",
 			TableName:         "users",
 			PartitionStrategy: PartitionStrategyIntegerRange,
 			RangeStart:        ptrInt64(1),
-			RangeEnd:          ptrInt64(10),
+			RangeEnd:          ptrInt64(5),
 			ChunkSize:         5,
 		}
-		q := s.buildChunkQuery(chunk, "id", []string{"id"}, "")
-		assert.Equal(t, `SELECT * FROM "public"."users" WHERE "id" >= 1 AND "id" <= 10 ORDER BY id LIMIT 5`, q)
+		query := requireChunkQuery(t, s, chunk, "id", []string{"id"}, "")
+		assert.Equal(t, `SELECT * FROM "public"."users" WHERE "id" >= 1 AND "id" <= 5 ORDER BY id LIMIT 5`, query)
 	})
 
-	t.Run("offset strategy injects condition into WHERE", func(t *testing.T) {
+	t.Run("offset applies condition", func(t *testing.T) {
 		chunk := &Chunk{
 			TableSchema:       "public",
 			TableName:         "orders",
@@ -128,90 +137,198 @@ func TestBuildChunkQueryWithCondition(t *testing.T) {
 			ChunkSize:         100,
 			ChunkStart:        200,
 		}
-		q := s.buildChunkQuery(chunk, "id", nil, "status = 'active'")
-		assert.Contains(t, q, "WHERE (status = 'active')")
-		assert.Contains(t, q, "ORDER BY id LIMIT 100 OFFSET 200")
+		query := requireChunkQuery(t, s, chunk, "id", nil, "status = 'active'")
+		assert.Contains(t, query, "WHERE (status = 'active')")
+		assert.Contains(t, query, "ORDER BY id LIMIT 100 OFFSET 200")
 	})
 
-	t.Run("OR in condition is parenthesized with integer range", func(t *testing.T) {
+	t.Run("condition preserves OR precedence", func(t *testing.T) {
 		chunk := &Chunk{
 			TableSchema:       "public",
 			TableName:         "users",
 			PartitionStrategy: PartitionStrategyIntegerRange,
 			RangeStart:        ptrInt64(1),
-			RangeEnd:          ptrInt64(1000),
+			RangeEnd:          ptrInt64(500),
 			ChunkSize:         500,
 		}
-		q := s.buildChunkQuery(chunk, "id", []string{"id"}, "status = 'a' OR status = 'b'")
-		assert.Contains(t, q, "AND (status = 'a' OR status = 'b')")
+		query := requireChunkQuery(t, s, chunk, "id", []string{"id"}, "status = 'a' OR status = 'b'")
+		assert.Contains(t, query, "AND (status = 'a' OR status = 'b')")
 	})
 
-	t.Run("offset strategy without condition omits WHERE", func(t *testing.T) {
+	t.Run("offset without condition omits WHERE", func(t *testing.T) {
 		chunk := &Chunk{
 			TableSchema:       "public",
 			TableName:         "orders",
 			PartitionStrategy: PartitionStrategyOffset,
 			ChunkSize:         100,
-			ChunkStart:        0,
 		}
-		q := s.buildChunkQuery(chunk, "id", nil, "")
-		assert.NotContains(t, q, "WHERE")
+		assert.NotContains(t, requireChunkQuery(t, s, chunk, "id", nil, ""), "WHERE")
 	})
 
-	t.Run("ctid block with bounds injects condition", func(t *testing.T) {
+	t.Run("bounded CTID applies condition", func(t *testing.T) {
 		chunk := &Chunk{
 			TableSchema:       "public",
 			TableName:         "events",
 			PartitionStrategy: PartitionStrategyCTIDBlock,
 			BlockStart:        ptrInt64(0),
 			BlockEnd:          ptrInt64(100),
+			ChunkSize:         100,
 		}
-		q := s.buildChunkQuery(chunk, "", nil, "tenant_id = 7")
-		assert.Contains(t, q, "WHERE ctid >= '(0,0)'::tid AND ctid < '(100,0)'::tid AND (tenant_id = 7)")
+		query := requireChunkQuery(t, s, chunk, "", nil, "tenant_id = 7")
+		assert.Contains(t, query, "WHERE ctid >= '(0,0)'::tid AND ctid < '(100,0)'::tid AND (tenant_id = 7)")
 	})
 
-	t.Run("ctid last chunk (nil BlockEnd) injects condition", func(t *testing.T) {
+	t.Run("last CTID chunk has no upper bound", func(t *testing.T) {
 		chunk := &Chunk{
 			TableSchema:       "public",
 			TableName:         "events",
 			PartitionStrategy: PartitionStrategyCTIDBlock,
 			BlockStart:        ptrInt64(50),
-			BlockEnd:          nil,
 			IsLastChunk:       true,
+			ChunkSize:         100,
 		}
-		q := s.buildChunkQuery(chunk, "", nil, "tenant_id = 7")
-		assert.Contains(t, q, "WHERE ctid >= '(50,0)'::tid AND (tenant_id = 7)")
+		query := requireChunkQuery(t, s, chunk, "", nil, "tenant_id = 7")
+		assert.Contains(t, query, "WHERE ctid >= '(50,0)'::tid AND (tenant_id = 7)")
 	})
 
-	t.Run("ctid empty table with condition uses WHERE", func(t *testing.T) {
+	t.Run("empty CTID table selects all visible rows", func(t *testing.T) {
 		chunk := &Chunk{
 			TableSchema:       "public",
 			TableName:         "events",
 			PartitionStrategy: PartitionStrategyCTIDBlock,
+			ChunkSize:         100,
 		}
-		q := s.buildChunkQuery(chunk, "", nil, "tenant_id = 7")
-		assert.Contains(t, q, `FROM "public"."events" WHERE (tenant_id = 7)`)
+		assert.Contains(t, requireChunkQuery(t, s, chunk, "", nil, "tenant_id = 7"), `FROM "public"."events" WHERE (tenant_id = 7)`)
+		assert.NotContains(t, requireChunkQuery(t, s, chunk, "", nil, ""), "WHERE")
 	})
 
-	t.Run("ctid empty table without condition has no WHERE", func(t *testing.T) {
-		chunk := &Chunk{
-			TableSchema:       "public",
-			TableName:         "events",
-			PartitionStrategy: PartitionStrategyCTIDBlock,
-		}
-		q := s.buildChunkQuery(chunk, "", nil, "")
-		assert.NotContains(t, q, "WHERE")
-	})
-
-	t.Run("integer range without bounds falls back to offset with condition", func(t *testing.T) {
+	t.Run("empty integer range is guaranteed empty", func(t *testing.T) {
 		chunk := &Chunk{
 			TableSchema:       "public",
 			TableName:         "users",
 			PartitionStrategy: PartitionStrategyIntegerRange,
 			ChunkSize:         10,
 		}
-		q := s.buildChunkQuery(chunk, "id", []string{"id"}, "is_active = true")
-		assert.Contains(t, q, "WHERE (is_active = true)")
-		assert.Contains(t, q, "ORDER BY id LIMIT 10")
+		query := requireChunkQuery(t, s, chunk, "id", []string{"id"}, "is_active = true")
+		assert.Equal(t, `SELECT * FROM "public"."users" WHERE FALSE`, query)
 	})
+}
+
+func TestBuildChunkQueryRejectsInvalidMetadata(t *testing.T) {
+	s := &Snapshotter{}
+	tests := []struct {
+		name      string
+		chunk     *Chunk
+		orderBy   string
+		pkColumns []string
+	}{
+		{
+			name: "incomplete integer bounds",
+			chunk: &Chunk{
+				PartitionStrategy: PartitionStrategyIntegerRange,
+				RangeStart:        ptrInt64(1),
+				ChunkSize:         10,
+			},
+			orderBy: "id",
+		},
+		{
+			name: "integer range wider than chunk size",
+			chunk: &Chunk{
+				PartitionStrategy: PartitionStrategyIntegerRange,
+				RangeStart:        ptrInt64(1),
+				RangeEnd:          ptrInt64(11),
+				ChunkSize:         10,
+			},
+			orderBy:   "id",
+			pkColumns: []string{"id"},
+		},
+		{
+			name: "bounded integer chunk without one primary key",
+			chunk: &Chunk{
+				PartitionStrategy: PartitionStrategyIntegerRange,
+				RangeStart:        ptrInt64(1),
+				RangeEnd:          ptrInt64(10),
+				ChunkSize:         10,
+			},
+			orderBy: "id",
+		},
+		{
+			name: "bounded CTID chunk without upper bound",
+			chunk: &Chunk{
+				PartitionStrategy: PartitionStrategyCTIDBlock,
+				BlockStart:        ptrInt64(1),
+				ChunkSize:         10,
+			},
+		},
+		{
+			name: "unknown strategy",
+			chunk: &Chunk{
+				PartitionStrategy: PartitionStrategy("mystery"),
+				ChunkSize:         10,
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := s.buildChunkQuery(test.chunk, test.orderBy, test.pkColumns, "")
+			require.Error(t, err)
+		})
+	}
+}
+
+func TestParseRowRejectsMismatchedShape(t *testing.T) {
+	s := &Snapshotter{}
+	_, err := s.parseRow([]pgconn.FieldDescription{{Name: "id"}}, nil)
+	require.Error(t, err)
+}
+
+func TestParsePrimaryKeyColumnsValidatesMetadata(t *testing.T) {
+	results := []*pgconn.Result{{Rows: [][][]byte{
+		{[]byte("tenant_id"), []byte("BIGINT")},
+		{[]byte("id"), []byte("integer")},
+	}}}
+	columns, err := parsePrimaryKeyColumns(results)
+	require.NoError(t, err)
+	assert.Equal(t, []primaryKeyColumn{
+		{Name: "tenant_id", DataType: "bigint"},
+		{Name: "id", DataType: "integer"},
+	}, columns)
+
+	for _, test := range []struct {
+		name    string
+		results []*pgconn.Result
+	}{
+		{name: "multiple results", results: []*pgconn.Result{{}, {}}},
+		{name: "missing name", results: []*pgconn.Result{{Rows: [][][]byte{{nil, []byte("bigint")}}}}},
+		{name: "missing type", results: []*pgconn.Result{{Rows: [][][]byte{{[]byte("id"), nil}}}}},
+		{name: "unexpected field", results: []*pgconn.Result{{Rows: [][][]byte{{[]byte("id")}}}}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := parsePrimaryKeyColumns(test.results); err == nil {
+				t.Fatal("parsePrimaryKeyColumns() accepted invalid metadata")
+			}
+		})
+	}
+}
+
+func TestParseSnapshotCheckpoint(t *testing.T) {
+	valid := []*pgconn.Result{{Rows: [][][]byte{{[]byte("0/10")}}}}
+	lsn, err := parseSnapshotCheckpoint(valid)
+	require.NoError(t, err)
+	assert.Equal(t, "0/10", lsn.String())
+
+	for _, test := range []struct {
+		name    string
+		results []*pgconn.Result
+	}{
+		{name: "missing result"},
+		{name: "malformed", results: []*pgconn.Result{{Rows: [][][]byte{{[]byte("bad")}}}}},
+		{name: "zero", results: []*pgconn.Result{{Rows: [][][]byte{{[]byte("0/0")}}}}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := parseSnapshotCheckpoint(test.results)
+			require.Error(t, err)
+		})
+	}
 }

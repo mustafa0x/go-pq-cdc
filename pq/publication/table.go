@@ -22,7 +22,7 @@ const (
 	SnapshotPartitionStrategyOffset SnapshotPartitionStrategy = "offset"
 )
 
-// ValidSnapshotPartitionStrategies contains all valid partition strategy options
+// ValidSnapshotPartitionStrategies contains all valid partition strategy options.
 var ValidSnapshotPartitionStrategies = []SnapshotPartitionStrategy{
 	SnapshotPartitionStrategyAuto,
 	SnapshotPartitionStrategyIntegerRange,
@@ -70,6 +70,10 @@ func (tc Table) Validate() error {
 		if err := ValidateQueryCondition(tc.QueryCondition); err != nil {
 			return errors.Wrap(err, "queryCondition")
 		}
+	}
+
+	if !slices.Contains(ValidSnapshotPartitionStrategies, tc.SnapshotPartitionStrategy) {
+		return errors.Newf("undefined snapshot partition strategy %q", tc.SnapshotPartitionStrategy)
 	}
 
 	return nil

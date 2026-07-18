@@ -1,10 +1,11 @@
 package message
 
 import (
+	"errors"
+	"fmt"
 	"time"
 
 	"github.com/Trendyol/go-pq-cdc/pq/message/format"
-	"github.com/go-playground/errors"
 )
 
 const (
@@ -68,6 +69,6 @@ func New(data []byte, streamedTransaction bool, serverTime time.Time, relation m
 		}
 		return msg, err
 	default:
-		return nil, errors.Wrap(ErrorByteNotSupported, string(data[0]))
+		return nil, fmt.Errorf("message type %q: %w", data[0], ErrorByteNotSupported)
 	}
 }

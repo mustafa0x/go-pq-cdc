@@ -3,7 +3,7 @@ package replication
 import (
 	"context"
 	"encoding/binary"
-	goerrors "errors"
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -15,7 +15,6 @@ import (
 	"github.com/Trendyol/go-pq-cdc/pq"
 	"github.com/Trendyol/go-pq-cdc/pq/message"
 	"github.com/Trendyol/go-pq-cdc/pq/message/format"
-	"github.com/go-playground/errors"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgproto3"
 )
@@ -23,11 +22,13 @@ import (
 var (
 	ErrorSlotInUse    = errors.New("replication slot in use")
 	ErrorNotConnected = errors.New("stream is not connected")
-	ErrorStreamClosed = goerrors.New("stream is closed")
+	ErrorStreamClosed = errors.New("stream is closed")
 )
 
 const (
 	StandbyStatusUpdateByteID = 'r'
+	streamReceivePollInterval = 300 * time.Millisecond
+	standbyStatusInterval     = 10 * time.Second
 )
 
 type ListenerContext struct {
@@ -66,6 +67,7 @@ type stream struct {
 	listenerFunc        ListenerFunc
 	sinkEnd             chan struct{}
 	processEnd          chan struct{}
+	feedbackCh          chan struct{}
 	doneCtx             context.Context
 	finish              context.CancelCauseFunc
 	mu                  sync.RWMutex
@@ -74,14 +76,11 @@ type stream struct {
 	lastXLogPos         pq.LSN
 	confirmedXLogPos    pq.LSN
 	openFromSnapshotLSN bool
+	snapshotLSN         pq.LSN
 	closed              atomic.Bool
 	sinkStarted         atomic.Bool
 	processStarted      atomic.Bool
 	closeOnce           sync.Once
-	// connMu serializes every use of conn while streaming. ReceiveMessage toggles
-	// the socket deadline, so feedback writes must not overlap it. connMu is
-	// always acquired before mu, never the reverse.
-	connMu sync.Mutex
 }
 
 func NewStream(dsn string, cfg config.Config, m metric.Metric, listenerFunc ListenerFunc) Streamer {
@@ -95,6 +94,7 @@ func NewStream(dsn string, cfg config.Config, m metric.Metric, listenerFunc List
 		listenerFunc: listenerFunc,
 		sinkEnd:      make(chan struct{}),
 		processEnd:   make(chan struct{}),
+		feedbackCh:   make(chan struct{}, 1),
 		doneCtx:      doneCtx,
 		finish:       finish,
 	}
@@ -102,17 +102,17 @@ func NewStream(dsn string, cfg config.Config, m metric.Metric, listenerFunc List
 
 func (s *stream) Connect(ctx context.Context) error {
 	if err := s.conn.Connect(ctx); err != nil {
-		return errors.Wrap(err, "stream connection")
+		return fmt.Errorf("stream connection: %w", err)
 	}
 
 	system, err := pq.IdentifySystem(ctx, s.conn)
 	if err != nil {
 		_ = s.conn.Close(ctx)
-		return errors.Wrap(err, "identify system")
+		return fmt.Errorf("identify system: %w", err)
 	}
 
 	s.system = &system
-	logger.Info("system identification", "systemID", system.SystemID, "timeline", system.Timeline, "xLogPos", system.LoadXLogPos(), "database:", system.Database)
+	logger.Info("system identification", "systemID", system.SystemID, "timeline", system.Timeline, "xLogPos", system.LoadXLogPos(), "database", system.Database)
 	return nil
 }
 
@@ -123,10 +123,10 @@ func (s *stream) Open(ctx context.Context) error {
 
 	if err := s.setup(ctx); err != nil {
 		var v *pgconn.PgError
-		if goerrors.As(err, &v) && v.Code == "55006" {
+		if errors.As(err, &v) && v.Code == "55006" {
 			return ErrorSlotInUse
 		}
-		return errors.Wrap(err, "replication setup")
+		return fmt.Errorf("replication setup: %w", err)
 	}
 
 	s.sinkStarted.Store(true)
@@ -145,9 +145,13 @@ func (s *stream) setup(ctx context.Context) error {
 
 	replicationStartLsn := s.lastXLogPos
 	if s.openFromSnapshotLSN {
-		snapshotLSN, err := s.fetchSnapshotLSN(ctx)
-		if err != nil {
-			return errors.Wrap(err, "fetch snapshot LSN")
+		snapshotLSN := s.snapshotLSN
+		if snapshotLSN == 0 {
+			var err error
+			snapshotLSN, err = s.fetchSnapshotLSN(ctx)
+			if err != nil {
+				return fmt.Errorf("fetch snapshot LSN: %w", err)
+			}
 		}
 		replicationStartLsn = snapshotLSN
 	}
@@ -180,7 +184,6 @@ type messageBuffer struct {
 	outCh   chan<- *Message
 }
 
-// flush emits the pending message (if any) with its original WAL position.
 func (b *messageBuffer) flush() {
 	if b.pending != nil {
 		b.outCh <- b.pending
@@ -188,26 +191,17 @@ func (b *messageBuffer) flush() {
 	}
 }
 
-// flushWithLSN emits the pending message (if any), rewriting its WAL position
-// to the given transaction-end LSN. Used at COMMIT.
 func (b *messageBuffer) flushWithLSN(lsn pq.LSN) {
 	if b.pending != nil {
-		b.outCh <- &Message{
-			message:  b.pending.message,
-			walStart: b.pending.walStart,
-			ackLSN:   lsn,
-		}
-		b.pending = nil
+		b.pending.ackLSN = lsn
+		b.flush()
 	}
 }
 
-// discard drops the pending message without emitting.
-// Used at BEGIN to reset state.
 func (b *messageBuffer) discard() {
 	b.pending = nil
 }
 
-// buffer stores a new DML message, first flushing any previously pending one.
 func (b *messageBuffer) buffer(msg *Message) {
 	b.flush()
 	b.pending = msg
@@ -230,7 +224,6 @@ type streamTxBuffer struct {
 	streaming bool
 }
 
-// startTx marks the beginning of a streaming chunk for the given XID.
 func (s *streamTxBuffer) startTx(xid uint32) {
 	if s.txns == nil {
 		s.txns = make(map[uint32][]*Message)
@@ -239,39 +232,26 @@ func (s *streamTxBuffer) startTx(xid uint32) {
 	s.streaming = true
 }
 
-// append adds a message to the currently active streaming transaction.
 func (s *streamTxBuffer) append(msg *Message) {
-	if msg != nil {
-		s.txns[s.activeXid] = append(s.txns[s.activeXid], msg)
-	}
+	s.txns[s.activeXid] = append(s.txns[s.activeXid], msg)
 }
 
-// stopTx marks the end of the current streaming chunk.
 func (s *streamTxBuffer) stopTx() {
 	s.streaming = false
 }
 
-// flushTx emits every accumulated message for the given XID through outCh.
-// The last message's WAL position is rewritten to the transaction-end LSN.
 func (s *streamTxBuffer) flushTx(xid uint32, outCh chan<- *Message, endLSN pq.LSN) {
 	s.streaming = false
 	msgs := s.txns[xid]
-	n := len(msgs)
-	for i, msg := range msgs {
-		if i == n-1 {
-			outCh <- &Message{
-				message:  msg.message,
-				walStart: msg.walStart,
-				ackLSN:   endLSN,
-			}
-		} else {
-			outCh <- msg
-		}
+	if len(msgs) > 0 {
+		msgs[len(msgs)-1].ackLSN = endLSN
+	}
+	for _, msg := range msgs {
+		outCh <- msg
 	}
 	delete(s.txns, xid)
 }
 
-// discardTx drops all accumulated messages for the given XID without emitting.
 func (s *streamTxBuffer) discardTx(xid uint32) {
 	s.streaming = false
 	delete(s.txns, xid)
@@ -286,7 +266,7 @@ func (s *stream) sink(ctx context.Context) {
 	s.finish(streamErr)
 	close(s.messageCH)
 
-	if streamErr != nil && !goerrors.Is(streamErr, context.Canceled) {
+	if streamErr != nil && !errors.Is(streamErr, context.Canceled) {
 		logger.Error("postgres stream stopped", "error", streamErr)
 	}
 }
@@ -294,20 +274,30 @@ func (s *stream) sink(ctx context.Context) {
 // sinkLoop reads raw replication messages and dispatches them until the
 // connection is closed, its context is canceled, or a fatal error occurs.
 func (s *stream) sinkLoop(ctx context.Context, buf *messageBuffer, streamBuf *streamTxBuffer) error {
+	nextStatusUpdate := time.Now().Add(standbyStatusInterval)
 	for {
 		if err := s.Err(); err != nil {
 			return err
 		}
 
-		msgCtx, cancel := context.WithTimeout(ctx, 300*time.Millisecond)
-		// Hold connMu only for the read itself. ReceiveMessage's deferred Unwatch
-		// (which clears the socket deadline) has run by the time it returns, so the
-		// deadline-toggle window is fully contained here; releasing before the
-		// channel sends in handleXLogData keeps acks from blocking the sink and
-		// vice versa.
-		s.connMu.Lock()
+		now := time.Now()
+		statusDue := !now.Before(nextStatusUpdate)
+		select {
+		case <-s.feedbackCh:
+			statusDue = true
+		default:
+		}
+		if statusDue {
+			if s.LoadXLogPos() > 0 {
+				if err := s.sendStandbyStatusUpdate(ctx); err != nil {
+					return fmt.Errorf("send standby status update: %w", err)
+				}
+			}
+			nextStatusUpdate = now.Add(standbyStatusInterval)
+		}
+
+		msgCtx, cancel := context.WithTimeout(ctx, streamReceivePollInterval)
 		rawMsg, err := s.conn.ReceiveMessage(msgCtx)
-		s.connMu.Unlock()
 		cancel()
 
 		if terminalErr := s.Err(); terminalErr != nil {
@@ -322,12 +312,6 @@ func (s *stream) sinkLoop(ctx context.Context, buf *messageBuffer, streamBuf *st
 				return context.Cause(ctx)
 			}
 			if pgconn.Timeout(err) {
-				if s.LoadXLogPos() > 0 {
-					if err := s.sendStandbyStatusUpdate(ctx); err != nil {
-						return fmt.Errorf("send standby status update: %w", err)
-					}
-					logger.Debug("send stand by status update")
-				}
 				continue
 			}
 			return fmt.Errorf("receive replication message: %w", err)
@@ -341,13 +325,20 @@ func (s *stream) sinkLoop(ctx context.Context, buf *messageBuffer, streamBuf *st
 			continue
 		}
 		if len(copyData.Data) == 0 {
-			return goerrors.New("received empty replication copy data")
+			return errors.New("received empty replication copy data")
 		}
 
 		switch copyData.Data[0] {
 		case message.PrimaryKeepaliveMessageByteID:
-			if err := s.handleKeepalive(ctx, copyData.Data[1:]); err != nil {
+			replyRequested, err := s.handleKeepalive(copyData.Data[1:])
+			if err != nil {
 				return fmt.Errorf("handle primary keepalive: %w", err)
+			}
+			if replyRequested {
+				if err := s.sendStandbyStatusUpdate(ctx); err != nil {
+					return fmt.Errorf("reply to primary keepalive: %w", err)
+				}
+				nextStatusUpdate = time.Now().Add(standbyStatusInterval)
 			}
 		case message.XLogDataByteID:
 			if err := s.handleXLogData(copyData.Data[1:], buf, streamBuf); err != nil {
@@ -374,27 +365,15 @@ func extractCopyData(rawMsg pgproto3.BackendMessage) (*pgproto3.CopyData, error)
 	}
 }
 
-// handleKeepalive processes a primary keepalive message, updating the WAL
-// position and responding with a standby status update when requested.
-func (s *stream) handleKeepalive(ctx context.Context, data []byte) error {
+func (s *stream) handleKeepalive(data []byte) (bool, error) {
 	pkm, err := format.NewPrimaryKeepaliveMessage(data)
 	if err != nil {
-		return fmt.Errorf("decode primary keepalive message: %w", err)
+		return false, fmt.Errorf("decode primary keepalive message: %w", err)
 	}
-
 	if pkm.ServerWALEnd > 0 {
 		s.UpdateXLogPos(pkm.ServerWALEnd)
-		logger.Debug("updated xlog position from keepalive", "serverWALEnd", pkm.ServerWALEnd.String())
 	}
-
-	if pkm.ReplyRequested {
-		if err := s.sendStandbyStatusUpdate(ctx); err != nil {
-			return err
-		}
-		logger.Debug("standby status update sent on keepalive request")
-	}
-
-	return nil
+	return pkm.ReplyRequested, nil
 }
 
 // handleXLogData parses a WAL data message, decodes the logical replication
@@ -406,7 +385,7 @@ func (s *stream) handleXLogData(data []byte, buf *messageBuffer, streamBuf *stre
 	}
 
 	if len(xld.WALData) == 0 {
-		return goerrors.New("received empty logical replication message")
+		return errors.New("received empty logical replication message")
 	}
 	logger.Debug("wal received",
 		"messageType", string(xld.WALData[0]),
@@ -416,18 +395,18 @@ func (s *stream) handleXLogData(data []byte, buf *messageBuffer, streamBuf *stre
 	)
 
 	s.UpdateXLogPos(xld.ServerWALEnd)
-	s.metric.SetCDCLatency(time.Now().UTC().Sub(xld.ServerTime).Nanoseconds())
+	s.metric.SetCDCLatency(time.Since(xld.ServerTime).Nanoseconds())
 
 	decodedMsg, err := message.New(xld.WALData, streamBuf.streaming, xld.ServerTime, s.relation)
 	if err != nil {
-		if ignorableLogicalMetadata(xld.WALData) {
+		if ignorableLogicalMetadata(xld.WALData, err) {
 			logger.Debug("ignoring logical metadata message", "type", string(xld.WALData[0]))
 			return nil
 		}
 		return fmt.Errorf("decode logical message: %w", err)
 	}
 	if decodedMsg == nil {
-		return goerrors.New("logical message decoder returned nil without error")
+		return errors.New("logical message decoder returned nil without error")
 	}
 
 	// add LSN to insert/update/delete messages
@@ -444,16 +423,12 @@ func (s *stream) handleXLogData(data []byte, buf *messageBuffer, streamBuf *stre
 	return nil
 }
 
-func ignorableLogicalMetadata(data []byte) bool {
-	if len(data) == 0 {
+func ignorableLogicalMetadata(data []byte, err error) bool {
+	if len(data) == 0 || !errors.Is(err, message.ErrorByteNotSupported) {
 		return false
 	}
-	switch message.Type(data[0]) {
-	case message.TypeByte, message.OriginByte:
-		return true
-	default:
-		return false
-	}
+	typeByte := message.Type(data[0])
+	return typeByte == message.TypeByte || typeByte == message.OriginByte
 }
 
 // dispatchMessage routes a decoded logical replication event to the correct
@@ -482,27 +457,21 @@ func (s *stream) dispatchMessage(decodedMsg any, xld XLogData, buf *messageBuffe
 		}
 
 	case *format.StreamStart:
-		// Beginning of a streaming chunk – DML events that follow belong
-		// to an in-progress transaction and must be buffered per-XID.
 		streamBuf.startTx(msg.Xid)
 
 	case *format.StreamStop:
-		// End of a streaming chunk. Nothing is emitted to the consumer.
 		streamBuf.stopTx()
 
 	case *format.StreamCommit:
-		// Final commit of a streamed transaction – emit all messages for this XID.
 		streamBuf.flushTx(msg.Xid, buf.outCh, msg.TransactionEndLSN)
 		if s.config.Listener.EmitTransactionBoundaries {
 			buf.outCh <- &Message{message: msg, walStart: xld.WALStart, ackLSN: msg.TransactionEndLSN}
 		}
 
 	case *format.StreamAbort:
-		// Streamed transaction rolled back – discard messages for this XID.
 		streamBuf.discardTx(msg.Xid)
 
 	default:
-		// DML event (Insert, Update, Delete, Relation, …)
 		m := &Message{
 			message:  decodedMsg,
 			walStart: xld.WALStart,
@@ -525,7 +494,7 @@ func (s *stream) process(ctx context.Context) {
 
 	ackTracker := &transactionAckTracker{}
 	for msg := range s.messageCH {
-		if msg == nil || ctx.Err() != nil || s.doneCtx.Err() != nil {
+		if ctx.Err() != nil || s.doneCtx.Err() != nil {
 			continue
 		}
 
@@ -553,7 +522,7 @@ func (s *stream) process(ctx context.Context) {
 			s.metric.UpdateOpIncrement(1)
 		}
 
-		start := time.Now().UTC()
+		start := time.Now()
 		s.listenerFunc(lCtx)
 		s.metric.SetProcessLatency(time.Since(start).Nanoseconds())
 	}
@@ -603,8 +572,11 @@ func (t *transactionAckTracker) ack(checkpoint *transactionAckCheckpoint, advanc
 func (s *stream) ackFuncForMessage(msg *Message, tracker *transactionAckTracker) func() error {
 	transactionAware := s.config.Listener.EmitTransactionBoundaries
 	var checkpoint *transactionAckCheckpoint
-	if transactionAware && isTransactionCommitBoundary(msg.message) {
-		checkpoint = tracker.register(msg.ackLSN)
+	if transactionAware {
+		switch msg.message.(type) {
+		case *format.Commit, *format.StreamCommit:
+			checkpoint = tracker.register(msg.ackLSN)
+		}
 	}
 
 	return func() error {
@@ -613,21 +585,16 @@ func (s *stream) ackFuncForMessage(msg *Message, tracker *transactionAckTracker)
 		if s.closed.Load() {
 			return ErrorStreamClosed
 		}
-		if !transactionAware {
-			s.UpdateConfirmedXLogPos(msg.ackLSN)
-		} else if checkpoint != nil {
+		if transactionAware {
+			if checkpoint == nil {
+				return nil
+			}
 			tracker.ack(checkpoint, s.UpdateConfirmedXLogPos)
+		} else {
+			s.UpdateConfirmedXLogPos(msg.ackLSN)
 		}
+		s.requestFeedback()
 		return nil
-	}
-}
-
-func isTransactionCommitBoundary(msg any) bool {
-	switch msg.(type) {
-	case *format.Commit, *format.StreamCommit:
-		return true
-	default:
-		return false
 	}
 }
 
@@ -657,9 +624,11 @@ func (s *stream) Close(ctx context.Context) {
 		// acknowledgement from the listener callback already in flight.
 		s.finish(context.Canceled)
 
-		if s.sinkStarted.Load() {
+		sinkStopped := !s.sinkStarted.Load()
+		if !sinkStopped {
 			select {
 			case <-s.sinkEnd:
+				sinkStopped = true
 				logger.Info("postgres message sink stopped")
 			case <-ctx.Done():
 				logger.Warn("timed out waiting for postgres message sink", "error", ctx.Err())
@@ -680,7 +649,13 @@ func (s *stream) Close(ctx context.Context) {
 		s.ackMu.Lock()
 		s.closed.Store(true)
 		if !s.conn.IsClosed() {
-			s.flushFinalStandbyStatusUpdate(ctx)
+			if sinkStopped && s.LoadConfirmedXLogPos() > 0 {
+				if err := s.sendStandbyStatusUpdate(ctx); err != nil {
+					logger.Warn("final standby status update failed, updates may duplicate on restart", "error", err)
+				} else {
+					logger.Debug("final standby status update sent")
+				}
+			}
 			if err := s.conn.Close(ctx); err != nil {
 				logger.Warn("close postgres connection", "error", err)
 			} else {
@@ -741,11 +716,20 @@ func (s *stream) OpenFromSnapshotLSN() {
 	s.openFromSnapshotLSN = true
 }
 
-// fetchSnapshotLSN reads the completed snapshot checkpoint used to start CDC.
+// OpenFromSnapshotLSNAt starts from the checkpoint returned by the snapshot
+// generation that was just delivered, avoiding a later mutable metadata read.
+func (s *stream) OpenFromSnapshotLSNAt(lsn pq.LSN) {
+	s.openFromSnapshotLSN = true
+	s.snapshotLSN = lsn
+}
+
+// fetchSnapshotLSN preserves the public no-argument API for callers that
+// coordinate snapshot execution outside Connector. Connector passes the exact
+// delivered generation through OpenFromSnapshotLSNAt instead.
 func (s *stream) fetchSnapshotLSN(ctx context.Context) (pq.LSN, error) {
 	conn, err := pq.NewConnection(ctx, s.config.DSN())
 	if err != nil {
-		return 0, errors.Wrap(err, "connect for snapshot LSN")
+		return 0, fmt.Errorf("connect for snapshot LSN: %w", err)
 	}
 	defer func() {
 		closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -754,59 +738,39 @@ func (s *stream) fetchSnapshotLSN(ctx context.Context) (pq.LSN, error) {
 	}()
 
 	query := fmt.Sprintf(`
-		SELECT snapshot_lsn, completed
+		SELECT snapshot_lsn
 		FROM cdc_snapshot_job
 		WHERE slot_name = %s
+		AND completed
 	`, pq.QuoteLiteral(s.config.Slot.Name))
-	reader := conn.Exec(ctx, query)
-	results, err := reader.ReadAll()
+	results, err := pq.ExecQuery(ctx, conn, query)
 	if err != nil {
-		_ = reader.Close()
-		return 0, errors.Wrap(err, "read snapshot LSN")
+		return 0, fmt.Errorf("read snapshot LSN: %w", err)
 	}
-	if err := reader.Close(); err != nil {
-		return 0, errors.Wrap(err, "close snapshot LSN result")
-	}
-	if len(results) == 0 || len(results[0].Rows) == 0 {
-		return 0, errors.New("snapshot job not found for slot: " + s.config.Slot.Name)
+	if len(results) == 0 || len(results[0].Rows) == 0 || len(results[0].Rows[0]) == 0 {
+		return 0, fmt.Errorf("completed snapshot job not found for slot %q", s.config.Slot.Name)
 	}
 
-	row := results[0].Rows[0]
-	if len(row) < 2 {
-		return 0, errors.New("invalid snapshot job row")
-	}
-	if completed := string(row[1]); completed != "t" && completed != "true" {
-		return 0, errors.New("snapshot job not completed for slot: " + s.config.Slot.Name)
-	}
-
-	lsn, err := pq.ParseLSN(string(row[0]))
+	lsn, err := pq.ParseLSN(string(results[0].Rows[0][0]))
 	if err != nil {
-		return 0, errors.Wrap(err, "parse snapshot LSN")
+		return 0, fmt.Errorf("parse snapshot LSN: %w", err)
 	}
 	logger.Info("fetched snapshot LSN", "slotName", s.config.Slot.Name, "snapshotLSN", lsn.String())
 	return lsn, nil
 }
 
-// sendStandbyStatusUpdate writes a standby status update under connMu so it can
-// never overlap the sink loop's ReceiveMessage, which toggles the connection's
-// socket deadline. Every status-update write — idle keepalive,
-// reply-on-request, and final close feedback — must go through here rather than
-// calling SendStandbyStatusUpdate directly. See the connMu field comment.
-func (s *stream) sendStandbyStatusUpdate(ctx context.Context) error {
-	s.connMu.Lock()
-	defer s.connMu.Unlock()
-	return SendStandbyStatusUpdate(ctx, s.conn, uint64(s.LoadXLogPos()), uint64(s.LoadConfirmedXLogPos()))
+func (s *stream) requestFeedback() {
+	select {
+	case s.feedbackCh <- struct{}{}:
+	default:
+	}
 }
 
-func (s *stream) flushFinalStandbyStatusUpdate(ctx context.Context) {
-	if s.LoadConfirmedXLogPos() == 0 {
-		return
-	}
-	if err := s.sendStandbyStatusUpdate(ctx); err != nil {
-		logger.Warn("final standby status update failed, updates may duplicate on restart", "error", err)
-		return
-	}
-	logger.Debug("final standby status update sent")
+// sendStandbyStatusUpdate is called only by the sink goroutine, or after the
+// sink has stopped during final cleanup. This keeps replication socket writes
+// single-owned without a connection mutex.
+func (s *stream) sendStandbyStatusUpdate(ctx context.Context) error {
+	return SendStandbyStatusUpdate(ctx, s.conn, uint64(s.LoadXLogPos()), uint64(s.LoadConfirmedXLogPos()))
 }
 
 func SendStandbyStatusUpdate(_ context.Context, conn pq.Connection, walReceivedPosition, walFlushedPosition uint64) error {
@@ -835,5 +799,5 @@ func AppendUint64(buf []byte, n uint64) []byte {
 }
 
 func timeToPgTime(t time.Time) uint64 {
-	return uint64(t.UTC().UnixMicro() - microSecFromUnixEpochToY2K)
+	return uint64(t.UnixMicro() - microSecFromUnixEpochToY2K)
 }

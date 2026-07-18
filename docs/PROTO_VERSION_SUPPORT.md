@@ -29,9 +29,10 @@ Validation now rejects unsupported values.
 Replication startup now uses `slot.protoVersion`:
 
 - Always sends `proto_version '<N>'`
-- Sends `messages 'true'` and `streaming 'true'` only when `protoVersion >= 2`
+- Sends `streaming 'true'` only when `protoVersion >= 2`
+- Does not request logical `messages`, which are not part of the listener contract
 
-This keeps startup compatible with older PostgreSQL versions while preserving advanced behavior on newer versions.
+Both protocol modes target the repository's PostgreSQL 16+ support floor.
 
 ### 3) Stream message decoding is complete
 
@@ -58,13 +59,12 @@ Result: rolled-back streamed transactions are never delivered to handlers.
 
 ### Use `protoVersion: 1` when:
 
-- PostgreSQL version is older than 14
-- You need maximum compatibility with minimal protocol features
+- You do not want streamed transaction protocol messages
 - You do not require streamed in-progress transaction handling
 
 ### Use `protoVersion: 2` when:
 
-- PostgreSQL version is 14+
+- PostgreSQL version is 16+
 - You want support for large/streamed in-progress transactions
 - You want strict rollback safety for streamed transactions
 
@@ -95,8 +95,8 @@ Slot: slot.Config{
 
 | slot.protoVersion | Minimum PostgreSQL | Streaming protocol messages |
 |-------------------|--------------------|-----------------------------|
-| 1                 | 10                 | No                          |
-| 2                 | 14                 | Yes                         |
+| 1                 | 16                 | No                          |
+| 2                 | 16                 | Yes                         |
 
 ## Test Coverage Added
 
@@ -118,7 +118,6 @@ If you do not set `slot.protoVersion`, default is `2`.
 
 Recommended migration path:
 
-1. Keep `protoVersion: 2` on PostgreSQL 14+.
-2. Set `protoVersion: 1` explicitly if your PostgreSQL is older.
-3. Run your CDC integration tests with both versions if you support mixed environments.
-
+1. Upgrade PostgreSQL to version 16 or newer before using this fork.
+2. Keep `protoVersion: 2` unless you intentionally disable streamed transaction handling.
+3. Run CDC integration tests with the protocol version used in production.

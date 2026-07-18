@@ -2,7 +2,7 @@ package snapshot
 
 import (
 	"context"
-	goerrors "errors"
+	"errors"
 	"fmt"
 	"os"
 	"sync"
@@ -14,17 +14,19 @@ import (
 	"github.com/Trendyol/go-pq-cdc/pq"
 	"github.com/Trendyol/go-pq-cdc/pq/message/format"
 	"github.com/Trendyol/go-pq-cdc/pq/publication"
-	"github.com/go-playground/errors"
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
-// Sentinel errors for snapshot operations
+const snapshotCleanupTimeout = 5 * time.Second
+
 var (
-	// ErrSnapshotInvalidated indicates the snapshot transaction was closed (coordinator restart)
-	ErrSnapshotInvalidated = goerrors.New("snapshot invalidated by coordinator restart")
+	// ErrSnapshotInvalidated indicates that the exported transaction no longer exists.
+	ErrSnapshotInvalidated = errors.New("snapshot invalidated by coordinator restart")
+	// ErrResnapshotSuperseded prevents an old request from executing a newer generation.
+	ErrResnapshotSuperseded = errors.New("resnapshot request was superseded")
 )
 
-// Handler SnapshotHandler is a function that handles snapshot events
+// Handler consumes snapshot events.
 type Handler func(event *format.Snapshot) error
 
 type Snapshotter struct {
@@ -39,13 +41,11 @@ type Snapshotter struct {
 	orderByCache       map[string]orderByCacheEntry
 	keepaliveDone      chan struct{}
 	dsn                string
-	cachedSnapshotID   string
 	tables             publication.Tables
 	config             config.SnapshotConfig
 	orderByMu          sync.RWMutex
 	keepaliveMu        sync.Mutex
 	closeOnce          sync.Once
-	exportConnClosed   bool
 }
 
 type orderByCacheEntry struct {
@@ -67,48 +67,41 @@ func New(ctx context.Context, snapshotConfig config.SnapshotConfig, tables publi
 	var err error
 	snapshotter.metadataConn, err = pq.NewConnection(ctx, dsn)
 	if err != nil {
-		return nil, errors.Wrap(err, "create metadata connection")
+		return nil, fmt.Errorf("create metadata connection: %w", err)
 	}
 
 	snapshotter.healthcheckConn, err = pq.NewConnection(ctx, dsn)
 	if err != nil {
 		snapshotter.Close(ctx)
-		return nil, errors.Wrap(err, "create healthcheck connection")
+		return nil, fmt.Errorf("create healthcheck connection: %w", err)
 	}
 
 	snapshotter.workerConn, err = pq.NewConnection(ctx, dsn)
 	if err != nil {
 		snapshotter.Close(ctx)
-		return nil, errors.Wrap(err, "create worker connection")
+		return nil, fmt.Errorf("create worker connection: %w", err)
 	}
 
 	return snapshotter, nil
 }
 
-// Prepare sets up snapshot metadata and exports snapshot transaction
-// This must be called BEFORE creating the replication slot to avoid data loss
-// Returns the snapshot LSN that should be used for replication slot creation
+// Prepare exports a consistent snapshot and persists its work plan. CDC callers
+// must establish WAL retention before calling it.
 //
 // Flow:
-//  1. Coordinator election
-//  2. Capture current LSN
-//  3. Create metadata (job, chunks)
-//  4. Export snapshot transaction (keeps transaction OPEN)
-//  5. Return LSN for slot creation
-//
-// IMPORTANT: Replication slot MUST be created immediately after this returns
-// to ensure no WAL changes are lost during snapshot execution
+//  1. Elect a coordinator.
+//  2. Capture the current LSN and export a read-only snapshot.
+//  3. Plan all chunks from that snapshot.
+//  4. Commit the job and chunks atomically.
 func (s *Snapshotter) Prepare(ctx context.Context, slotName string) error {
 	instanceID := generateInstanceID(s.config.InstanceID)
 	logger.Debug("[snapshot] preparing", "instanceID", instanceID)
+	s.orderByMu.Lock()
+	clear(s.orderByCache)
+	s.orderByMu.Unlock()
 
-	isCoordinator, err := s.setupJob(ctx, slotName, instanceID)
-	if err != nil {
-		return errors.Wrap(err, "setup job")
-	}
-
-	if isCoordinator {
-		logger.Debug("[coordinator] snapshot transaction kept OPEN - replication slot must be created NOW")
+	if err := s.setupJob(ctx, slotName, instanceID); err != nil {
+		return fmt.Errorf("setup job: %w", err)
 	}
 	return nil
 }
@@ -117,89 +110,88 @@ func (s *Snapshotter) Prepare(ctx context.Context, slotName string) error {
 // This should be called AFTER the replication slot is created with the LSN from Prepare()
 // Returns when snapshot is complete
 func (s *Snapshotter) Execute(ctx context.Context, handler Handler, slotName string) error {
+	_, err := s.ExecuteWithLSN(ctx, handler, slotName)
+	return err
+}
+
+// ExecuteWithLSN performs the snapshot and returns the exact checkpoint delivered to the handler.
+func (s *Snapshotter) ExecuteWithLSN(ctx context.Context, handler Handler, slotName string) (pq.LSN, error) {
 	startTime := time.Now()
 	instanceID := generateInstanceID(s.config.InstanceID)
 	logger.Debug("[snapshot] executing", "instanceID", instanceID)
 
-	// Load job
 	job, err := s.loadJob(ctx, slotName)
-	if err != nil || job == nil {
-		return errors.New("job not found - Prepare() must be called first")
-	}
-
-	// Execute worker processing (ALL instances work, including coordinator)
-	if err := s.executeWorker(ctx, slotName, instanceID, job, handler, startTime); err != nil {
-		return fmt.Errorf("execute worker: %w", err)
-	}
-
-	// Finalize (check completion, send END marker)
-	if err := s.finalizeSnapshot(ctx, slotName, job, handler); err != nil {
-		return errors.Wrap(err, "finalize snapshot")
-	}
-
-	logger.Info("[snapshot] execution completed", "instanceID", instanceID, "duration", time.Since(startTime))
-	return nil
-}
-
-// finalizeSnapshot checks completion, closes connections, and sends END marker
-func (s *Snapshotter) finalizeSnapshot(ctx context.Context, slotName string, job *Job, handler Handler) error {
-	completed, err := s.checkJobCompleted(ctx, slotName)
 	if err != nil {
-		return errors.Wrap(err, "check job completed")
+		return 0, fmt.Errorf("load snapshot job: %w", err)
 	}
-	if !completed {
-		return nil
+	if job == nil {
+		return 0, fmt.Errorf("snapshot job disappeared: %w", ErrSnapshotInvalidated)
+	}
+	if err := s.validateJobRequest(job); err != nil {
+		return 0, err
+	}
+
+	s.metric.SetSnapshotInProgress(true)
+	s.metric.SetSnapshotTotalTables(len(s.tables))
+	s.metric.SetSnapshotTotalChunks(job.TotalChunks)
+	defer func() {
+		s.metric.SetSnapshotInProgress(false)
+		s.metric.SetSnapshotDurationSeconds(time.Since(startTime).Seconds())
+	}()
+
+	if err := s.emitSnapshotMarker(ctx, job, format.SnapshotEventTypeBegin, handler); err != nil {
+		return 0, fmt.Errorf("emit snapshot begin: %w", err)
+	}
+	if err := s.workerProcess(ctx, instanceID, job, handler); err != nil {
+		return 0, fmt.Errorf("execute worker: %w", err)
 	}
 
 	logger.Info("[snapshot] all chunks completed, finalizing snapshot")
-	defer s.closeAllConnections(ctx)
-	return s.emitSnapshotMarker(ctx, slotName, format.SnapshotEventTypeEnd, job.SnapshotLSN, handler)
+	if err := s.emitSnapshotMarker(ctx, job, format.SnapshotEventTypeEnd, handler); err != nil {
+		return 0, fmt.Errorf("emit snapshot end: %w", err)
+	}
+	s.closeAllConnections()
+
+	logger.Info("[snapshot] execution completed", "instanceID", instanceID, "duration", time.Since(startTime))
+	return job.SnapshotLSN, nil
 }
 
 // closeAllConnections closes every connection owned by the snapshotter.
-func (s *Snapshotter) closeAllConnections(context.Context) {
+func (s *Snapshotter) closeAllConnections() {
 	s.closeOnce.Do(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 
 		logger.Info("[snapshot] closing all connections")
-		s.closeExportSnapshotConnection(ctx)
-		connections := []struct {
-			name string
-			conn pq.Connection
-		}{
-			{"worker", s.workerConn},
-			{"metadata", s.metadataConn},
-			{"healthcheck", s.healthcheckConn},
-		}
-		for _, connection := range connections {
-			if connection.conn != nil {
-				if err := connection.conn.Close(ctx); err != nil {
-					logger.Warn("[snapshot] error closing connection", "connection", connection.name, "error", err)
+		s.closeExportSnapshotConnection()
+		closeConnection := func(name string, conn pq.Connection) {
+			if conn != nil {
+				if err := conn.Close(ctx); err != nil {
+					logger.Warn("[snapshot] error closing connection", "connection", name, "error", err)
 				}
 			}
 		}
+		closeConnection("worker", s.workerConn)
+		closeConnection("metadata", s.metadataConn)
+		closeConnection("healthcheck", s.healthcheckConn)
 		logger.Info("[snapshot] all connections closed")
 	})
 }
 
 // closeExportSnapshotConnection rolls back the read-only exported transaction and closes it.
-func (s *Snapshotter) closeExportSnapshotConnection(ctx context.Context) {
-	s.stopSnapshotKeepalive()
-
+func (s *Snapshotter) closeExportSnapshotConnection() {
 	s.keepaliveMu.Lock()
-	if s.exportConnClosed {
-		s.keepaliveMu.Unlock()
-		return
-	}
-	s.exportConnClosed = true
+	s.stopSnapshotKeepaliveLocked()
 	exportConn := s.exportSnapshotConn
+	s.exportSnapshotConn = nil
 	s.keepaliveMu.Unlock()
 	if exportConn == nil {
 		return
 	}
 
-	if err := s.execSQL(ctx, exportConn, "ROLLBACK"); err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), snapshotCleanupTimeout)
+	defer cancel()
+	if err := pq.ExecSQL(ctx, exportConn, "ROLLBACK"); err != nil {
 		logger.Warn("[coordinator] failed to rollback snapshot transaction", "error", err)
 	}
 	if err := exportConn.Close(ctx); err != nil {
@@ -208,53 +200,36 @@ func (s *Snapshotter) closeExportSnapshotConnection(ctx context.Context) {
 }
 
 // Close releases every resource owned by the snapshotter.
-func (s *Snapshotter) Close(ctx context.Context) {
-	if s != nil {
-		s.closeAllConnections(ctx)
-	}
+func (s *Snapshotter) Close(context.Context) {
+	s.closeAllConnections()
 }
 
 func (s *Snapshotter) startSnapshotKeepalive(parentCtx context.Context, conn pq.Connection) {
-	keepaliveCtx, keepaliveCancel := context.WithCancel(parentCtx)
-	done := make(chan struct{})
-
 	s.keepaliveMu.Lock()
-	// Ensure previous keepalive is not left around during retries.
-	if s.keepaliveCancel != nil {
-		s.keepaliveCancel()
-	}
-	s.keepaliveCancel = keepaliveCancel
-	s.keepaliveDone = done
-	s.exportConnClosed = false
-	s.keepaliveMu.Unlock()
+	defer s.keepaliveMu.Unlock()
 
-	go s.snapshotTransactionKeepalive(keepaliveCtx, conn, done)
+	s.stopSnapshotKeepaliveLocked()
+	if s.exportSnapshotConn != conn {
+		return
+	}
+	keepaliveCtx, cancel := context.WithCancel(parentCtx)
+	s.keepaliveCancel = cancel
+	s.keepaliveDone = make(chan struct{})
+	go s.snapshotTransactionKeepalive(keepaliveCtx, conn, s.keepaliveDone)
 }
 
-func (s *Snapshotter) stopSnapshotKeepalive() {
-	s.keepaliveMu.Lock()
-	cancel := s.keepaliveCancel
-	done := s.keepaliveDone
+// stopSnapshotKeepaliveLocked stops the keepalive before its connection can be
+// replaced or closed. The caller owns keepaliveMu for the whole transition.
+func (s *Snapshotter) stopSnapshotKeepaliveLocked() {
+	if s.keepaliveCancel == nil {
+		return
+	}
+	s.keepaliveCancel()
+	<-s.keepaliveDone
 	s.keepaliveCancel = nil
 	s.keepaliveDone = nil
-	s.keepaliveMu.Unlock()
-
-	if cancel != nil {
-		cancel()
-	}
-	if done != nil {
-		<-done
-	}
 }
 
-// decodeColumnData decodes PostgreSQL column data using cached decoder
-func (s *Snapshotter) decodeColumnData(data []byte, dataTypeOID uint32) (interface{}, error) {
-	// Use cached decoder (optimization: avoid reflection overhead)
-	decoder := s.decoderCache.Get(dataTypeOID)
-	return decoder.Decode(s.typeMap, data)
-}
-
-// generateInstanceID generates a unique instance identifier
 func generateInstanceID(configuredID string) string {
 	if configuredID != "" {
 		return configuredID
@@ -265,6 +240,5 @@ func generateInstanceID(configuredID string) string {
 		hostname = "unknown"
 	}
 
-	pid := os.Getpid()
-	return fmt.Sprintf("%s-%d", hostname, pid)
+	return fmt.Sprintf("%s-%d", hostname, os.Getpid())
 }

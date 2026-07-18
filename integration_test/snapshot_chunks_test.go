@@ -37,7 +37,7 @@ func TestSnapshotMultipleChunks(t *testing.T) {
 	cdcCfg.Snapshot.Enabled = true
 	cdcCfg.Snapshot.Mode = "initial"
 	cdcCfg.Snapshot.ChunkSize = 25 // Small chunk size to create multiple chunks
-	cdcCfg.Snapshot.HeartbeatInterval = 30 * time.Second
+	cdcCfg.Snapshot.HeartbeatInterval = 10 * time.Second
 	cdcCfg.Snapshot.ClaimTimeout = 30 * time.Second
 	postgresConn, err := newPostgresConn()
 	require.NoError(t, err)

@@ -34,6 +34,8 @@ func (s *testStream) Err() error                              { return s.err }
 func (s *testStream) GetSystemInfo() *pq.IdentifySystemResult { return nil }
 func (s *testStream) GetMetric() metric.Metric                { return nil }
 func (s *testStream) OpenFromSnapshotLSN()                    {}
+func (s *testStream) OpenFromSnapshotLSNAt(pq.LSN)            {}
+func (s *testStream) UpdateXLogPos(pq.LSN)                    {}
 
 func newTestConnector() (*connector, *testServer) {
 	logger.InitLogger(logger.NewSlog(slog.LevelError))
@@ -84,6 +86,15 @@ func TestCloseCancelsRunContext(t *testing.T) {
 	case <-ctx.Done():
 	case <-time.After(time.Second):
 		t.Fatal("Close did not cancel the connector run context")
+	}
+}
+
+func TestStartAfterCloseReturnsCanceled(t *testing.T) {
+	connector, _ := newTestConnector()
+	connector.Close()
+
+	if err := connector.Start(context.Background()); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Start() error = %v, want context.Canceled", err)
 	}
 }
 

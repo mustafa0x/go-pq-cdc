@@ -14,10 +14,10 @@ ensuring low resource consumption and high performance.
 ✨ **Key Highlights:**
 - **Zero Data Loss**: Consistent point-in-time snapshot using PostgreSQL's `pg_export_snapshot()`
 - **Chunk-Based Processing**: Memory-efficient processing of large tables
-- **Smart Partitioning**: Auto-selects optimal strategy (Integer Range, CTID Block, or Offset)
+- **Smart Partitioning**: Auto-selects Integer Range or CTID Block; Offset remains an explicit compatibility option
 - **Multi-Instance Support**: Parallel processing across multiple instances
 - **Crash Recovery**: Automatic resume from failures
-- **No Duplicates**: Seamless transition from snapshot to CDC
+- **At-Least-Once Handoff**: The CDC checkpoint is captured before snapshot acquisition, preventing gaps; consumers should tolerate overlap
 - **Snapshot Only Mode**: One-time data export without CDC (no replication slot required)
 - **Protocol Flexibility**: `pgoutput` `proto_version` `1` and `2` support
 - **Safe Streaming TX Handling**: Streamed rollback transactions are discarded correctly
@@ -186,7 +186,7 @@ Add these grants when the corresponding feature is enabled:
 | `publication.createIfNotExists: true`         | `GRANT CREATE ON DATABASE <db> TO cdc_user;` so the publication can be created.                                                           |
 | `slot.createIfNotExists: true`                | `REPLICATION` role attribute (already in the example above).                                                                              |
 | Heartbeat with auto-created table             | `GRANT CREATE ON SCHEMA <schema> TO cdc_user;` for the initial `CREATE TABLE`, plus `GRANT INSERT, UPDATE ON <heartbeat_table>` for the auto-managed singleton row. |
-| Snapshot mode (initial / only)                | `SELECT` on the source tables (already covered above).                                                                                    |
+| Snapshot mode (initial / only)                | `SELECT` on source tables. For automatic metadata setup, grant `CREATE` on the metadata schema and retain ownership for migrations; otherwise pre-provision the documented metadata schema and grant its DML/sequence privileges. |
 | Adding tables to an existing publication      | The role must own the publication, e.g. `ALTER PUBLICATION cdc_publication OWNER TO cdc_user;`.                                           |
 
 Common failure modes when grants are missing:
@@ -377,12 +377,12 @@ You can run [Replica Identity Nothing](./example/replica-identity-nothing) for a
 | `publication.tables[i].schema`          |  string  |    no    | public  | Set the data change captured table schema name                                                        | Must be a valid table name in the specified database.                                                                                              |
 | `publication.tables[i].columns`                   | []string |    no    |   -   | Only include these columns in replication and snapshotting                                            | Must not be set when `replicaIdentity` is `FULL`; only compatible with `DEFAULT`.                                                                 |
 | `publication.tables[i].partitioned`               |   bool   |    no    | false | Flag for replicating a partitioned table via the root table name instead of listing out the individual table parts. Sets `publish_via_partition_root = true` when creating the publication. | Only avaible with PostgreSQL 13+. This is a publication-wide setting, Setting any table with this will include it for all tables in the publication.                                                                                                                                                   |
-| `publication.tables[i].snapshotPartitionStrategy` |  string  |    no    | auto  | Override partition strategy for snapshot                                                              | **auto:** Auto-detect best strategy. **integer_range:** Sequential integer PKs. **ctid_block:** String/UUID/hash PKs. **offset:** Slow fallback. |
+| `publication.tables[i].snapshotPartitionStrategy` |  string  |    no    | auto  | Override partition strategy for snapshot                                                              | **auto:** Auto-detect best strategy. **integer_range:** Sequential integer PKs. **ctid_block:** String/UUID/hash PKs. **offset:** Explicit LIMIT/OFFSET strategy (slow). |
 | `publication.tables[i].queryCondition`  |  string  |    no    |    -    | Per-table query condition for snapshot queries (SNAPSHOT-ONLY, does NOT affect CDC). Takes precedence over global `snapshot.queryCondition`. | Example: `"deleted_at IS NULL"`. Appended to WHERE clause with `AND`. |
 | `slot.createIfNotExists`                |   bool   |    no    |    -    | Create replication slot if not exists. Otherwise, return `replication slot is not exists` error.      |                                                                                                                                                    |
 | `slot.name`                             |  string  |   yes    |    -    | Set the logical replication slot name                                                                 | Should be unique and descriptive.                                                                                                                  |
 | `slot.slotActivityCheckerInterval`      |   int    |    no    |  1000   | Set the slot activity check interval time in milliseconds                                             | Specify as an integer value in milliseconds (e.g., `1000` for 1 second).                                                                           |
-| `slot.protoVersion`                     |   int    |    no    |    2    | `pgoutput` protocol version used in `START_REPLICATION`                                               | `1`: PostgreSQL 10+ compatibility, no streaming transaction protocol messages. `2`: PostgreSQL 14+, enables streaming/messages options.           |
+| `slot.protoVersion`                     |   int    |    no    |    2    | `pgoutput` protocol version used in `START_REPLICATION`                                               | Both versions require PostgreSQL 16+. `1`: no streaming transaction protocol messages. `2`: enables streamed transactions.           |
 | `snapshot.enabled`                      |   bool   |    no    |  false  | Enable initial snapshot feature                                                                       | When enabled, captures existing data before starting CDC.                                                                                          |
 | `snapshot.mode`                         |  string  |    no    |  never  | Snapshot mode: `initial`, `never`, or `snapshot_only`                                                 | **initial:** Take snapshot only if no previous snapshot exists, then start CDC. <br> **never:** Skip snapshot, start CDC immediately. <br> **snapshot_only:** Take snapshot and exit (no CDC, no replication slot required). |
 | `snapshot.chunkSize`                    |  int64   |    no    |  8000   | Number of rows per chunk during snapshot                                                              | Adjust based on table size. Larger chunks = fewer chunks but more memory per chunk.                                                               |
@@ -409,14 +409,14 @@ You can run [Replica Identity Nothing](./example/replica-identity-nothing) for a
 `go-pq-cdc` now supports both `pgoutput` protocol versions:
 
 - **`slot.protoVersion: 1`**
-  - Works with PostgreSQL 10+
+  - Requires PostgreSQL 16+
   - Starts replication with `proto_version '1'`
   - Does not request `messages 'true'` or `streaming 'true'`
-  - Best choice for older PostgreSQL versions or simpler CDC setups
+  - Compatibility choice when streamed transactions are not needed
 
 - **`slot.protoVersion: 2` (default)**
-  - Requires PostgreSQL 14+
-  - Starts replication with `proto_version '2'`, `messages 'true'`, and `streaming 'true'`
+  - Requires PostgreSQL 16+
+  - Starts replication with `proto_version '2'` and `streaming 'true'`
   - Supports streamed in-progress transactions (`STREAM START/STOP/COMMIT/ABORT`)
 
 Streaming behavior for `proto_version: 2`:
@@ -462,11 +462,13 @@ Import the grafana dashboard [json file](./grafana/dashboard.json).
 
 | go-pq-cdc Version | slot.protoVersion | Minimum PostgreSQL Server Version | Notes |
 |-------------------|-------------------|-----------------------------------|-------|
-| 0.0.2 or higher   | 1                 | 10                                | No streaming transaction protocol messages |
-| 0.0.2 or higher   | 2                 | 14                                | Supports streamed in-progress transactions |
+| Next fork release | 1                 | 16                                | No streaming transaction protocol messages |
+| Next fork release | 2                 | 16                                | Supports streamed in-progress transactions |
 
 ### Breaking Changes
 
 | Date taking effect | Version | Change | How to check |
 |--------------------|---------|--------|--------------|
+| Next release       | TBD     | This fork requires PostgreSQL 16 or newer. | Upgrade the source PostgreSQL server before deploying this release. |
+| Next release       | TBD     | `snapshot.resnapshotId` is required whenever `snapshot.resnapshot` is `true`. | Give every intentional resnapshot request a new stable ID shared by all connector instances. |
 | Next release       | TBD     | Startup fails when heartbeat is enabled but the heartbeat table is missing from a selective publication. | Ensure `publication.tables` includes your heartbeat table, or use a `FOR ALL TABLES` publication. See [Upgrade: heartbeat table must be in publication](#upgrade-heartbeat-table-must-be-in-publication). |

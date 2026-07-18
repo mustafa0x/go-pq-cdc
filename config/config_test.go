@@ -344,6 +344,21 @@ func TestSnapshotConfigValidateLeaseTiming(t *testing.T) {
 	})
 }
 
+func TestSnapshotConfigValidateRequiresResnapshotID(t *testing.T) {
+	cfg := SnapshotConfig{
+		Mode:              SnapshotModeInitial,
+		ChunkSize:         100,
+		ClaimTimeout:      30 * time.Second,
+		HeartbeatInterval: 5 * time.Second,
+		Enabled:           true,
+		Resnapshot:        true,
+	}
+
+	require.EqualError(t, cfg.Validate(), "snapshot.resnapshotId is required when resnapshot is enabled")
+	cfg.ResnapshotID = "rebuild-2026-07-18"
+	require.NoError(t, cfg.Validate())
+}
+
 func TestValidateSnapshotSubset(t *testing.T) {
 	t.Run("should preserve SnapshotPartitionStrategy from snapshot config", func(t *testing.T) {
 		cfg := Config{
@@ -546,6 +561,25 @@ func TestQueryConditionPropagation(t *testing.T) {
 		assert.Equal(t, "deleted_at IS NULL", tables[0].QueryCondition)
 		assert.Equal(t, "full", tables[0].ReplicaIdentity, "publication metadata is still merged in")
 	})
+}
+
+func TestSnapshotConfigValidateRejectsUnknownPartitionStrategy(t *testing.T) {
+	cfg := SnapshotConfig{
+		Enabled:           true,
+		Mode:              SnapshotModeSnapshotOnly,
+		ChunkSize:         100,
+		ClaimTimeout:      30 * time.Second,
+		HeartbeatInterval: 5 * time.Second,
+		Tables: publication.Tables{{
+			Name:                      "events",
+			Schema:                    "public",
+			SnapshotPartitionStrategy: publication.SnapshotPartitionStrategy("mystery"),
+		}},
+	}
+
+	err := cfg.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "undefined snapshot partition strategy")
 }
 
 func TestSnapshotConfigValidateQueryCondition(t *testing.T) {

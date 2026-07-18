@@ -24,5 +24,6 @@ type Snapshot struct {
 	Schema     string
 	LSN        pq.LSN
 	TotalRows  int64
-	IsLast     bool
+	// IsLast reports that this is the final row in its snapshot chunk.
+	IsLast bool
 }

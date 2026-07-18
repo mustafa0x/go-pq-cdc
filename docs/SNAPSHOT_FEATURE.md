@@ -82,7 +82,9 @@ Timeline:
   T3: Snapshot completes, CDC starts from LSN=X
       - CDC captures the 10 new rows
   
-Result: You get all 1M + 10 rows, with no duplicates!
+Result: You get all 1M + 10 rows without gaps. Transactions committed during
+the checkpoint-to-snapshot handoff can appear in both phases, so handlers must
+be idempotent.
 ```
 
 ### Use Cases
@@ -173,13 +175,14 @@ type Snapshotter struct {
 
 #### 4. **Metadata Tables**
 
-The snapshot feature uses two metadata tables to track progress. These tables are automatically created and migrated when needed.
+The snapshot feature uses three metadata tables to track progress and consumed resnapshot requests. These tables are automatically created and migrated when needed.
 
 **Job Table** (`cdc_snapshot_job`):
 ```sql
 CREATE TABLE cdc_snapshot_job (
     slot_name        TEXT PRIMARY KEY,
     snapshot_id      TEXT NOT NULL,
+    resnapshot_id    TEXT NOT NULL DEFAULT '',
     snapshot_lsn     TEXT NOT NULL,
     started_at       TIMESTAMP NOT NULL,
     completed        BOOLEAN DEFAULT FALSE,
@@ -216,6 +219,17 @@ CREATE TABLE cdc_snapshot_chunks (
 );
 ```
 
+**Resnapshot Request Table** (`cdc_snapshot_request`):
+```sql
+CREATE TABLE cdc_snapshot_request (
+    slot_name      TEXT NOT NULL,
+    resnapshot_id  TEXT NOT NULL,
+    PRIMARY KEY (slot_name, resnapshot_id)
+);
+```
+
+Request rows are retained so a late instance cannot replay an older resnapshot after a newer generation replaces it. A consumed ID is never executed again; recovery requires a new ID.
+
 ### Lifecycle Phases
 
 **Mermaid Flow Diagram:**
@@ -241,7 +255,7 @@ sequenceDiagram
     DB-->>I1: snapshot_id: "00000003-00000002-1"
     Note right of I1: Transaction kept OPEN!
     
-    Note over I1,Meta: Phase 3: Metadata Creation (in snapshot transaction)
+    Note over I1,Meta: Phase 3: Plan from snapshot, publish metadata atomically
     I1->>DB: SELECT pg_relation_size() (via snapshot conn)
     Note right of I1: Size queries see same data as workers!
     I1->>Meta: INSERT INTO cdc_snapshot_job (with snapshot_id)
@@ -277,7 +291,7 @@ sequenceDiagram
     I1->>Meta: Check if all chunks completed
     Meta-->>I1: All completed ✅
     I1->>Meta: UPDATE job SET completed = true
-    I1->>DB: COMMIT (close snapshot transaction)
+    I1->>DB: ROLLBACK (close read-only snapshot transaction)
     I1->>I1: Send END event to handler
     I1->>DB: START_REPLICATION SLOT ... LSN 0/12345678
     Note over I1: CDC continues from snapshot LSN
@@ -309,7 +323,7 @@ Phase 2: Snapshot Export (Coordinator Only) ← FIRST!
    • Cache snapshot_id for metadata creation
                     │
                     ▼
-Phase 3: Metadata Creation (in snapshot transaction)
+Phase 3: Snapshot-consistent planning and atomic metadata publication
 ─────────────────────────────────────────────────────
    • Query table sizes via snapshot connection
      (pg_relation_size sees consistent data!)
@@ -318,7 +332,7 @@ Phase 3: Metadata Creation (in snapshot transaction)
    • Auto-select partitioning strategy:
        - Integer Range: for sequential integer PKs
        - CTID Block: for string/UUID/hash PKs
-       - Offset: fallback (slow)
+       - Offset: explicit compatibility strategy (slow)
    • Save chunks to DB
                     │
                     ▼
@@ -345,7 +359,7 @@ Phase 5: CDC Continuation
    • All chunks completed
    • Snapshot transaction closed
    • CDC starts from snapshot LSN
-   • No duplicate data!
+   • No missing data; the handoff is at-least-once
 ```
 
 ---
@@ -354,7 +368,7 @@ Phase 5: CDC Continuation
 
 ### Prerequisites
 
-1. **PostgreSQL 14+** with logical replication enabled:
+1. **PostgreSQL 16+** with logical replication enabled:
    ```sql
    -- Check wal_level
    SHOW wal_level;  -- Must be 'logical'
@@ -371,6 +385,8 @@ Phase 5: CDC Continuation
    -- Grant access to tables
    GRANT SELECT ON ALL TABLES IN SCHEMA public TO your_user;
    ```
+
+   Automatic snapshot metadata creation also requires `CREATE` on the metadata schema and table ownership for unapplied migrations. A runtime role without DDL privileges can use metadata tables and indexes pre-provisioned with the documented schema.
 
 3. **Configure PostgreSQL** (`postgresql.conf`):
    ```ini
@@ -535,6 +551,7 @@ INSERT: map[id:1001 name:Charlie]  <-- New data after snapshot
 | `heartbeatInterval` | duration | `5s` | Interval for worker heartbeat updates |
 | `instanceId` | string | `hostname-pid` | Custom instance identifier (optional) |
 | `resnapshot` | bool | `false` | Force reprocessing by cleaning metadata for this slot (see below) |
+| `resnapshotId` | string | `""` | Required with `resnapshot: true`; stable ID shared by every instance participating in one resnapshot request |
 | `queryCondition` | string | `""` | Global query condition applied to all snapshot queries (SNAPSHOT-ONLY, see [Custom Query Conditions](#custom-query-conditions)) |
 
 ### Resnapshot
@@ -548,10 +565,12 @@ By default, the library checks `cdc_snapshot_job.completed` field. If a snapshot
 #### How It Works
 
 When `resnapshot: true`:
-1. **Cleans metadata for THIS slot only** - Deletes rows from `cdc_snapshot_job` and `cdc_snapshot_chunks` where `slot_name` matches
-2. **Does NOT affect other connectors** - Multiple teams can use different connectors in the same database safely
-3. **Preserves table structure** - Uses DELETE, not DROP TABLE, so indexes and schema remain intact
-4. **Triggers fresh snapshot** - After cleanup, proceeds with normal snapshot flow
+1. **Identifies the request** - Every instance in one deployment uses the same non-empty `resnapshotId`; consumed IDs are retained, and a later request uses a new ID
+2. **Elects one coordinator** - Only the instance holding the slot-scoped advisory lock replaces metadata; peers with the same request ID join that generation, including instances that start after it completes
+3. **Cleans metadata for THIS slot only** - Deletes rows from `cdc_snapshot_job` and `cdc_snapshot_chunks` where `slot_name` matches
+4. **Does NOT affect other connectors** - Multiple teams can use different connectors on the same database safely
+5. **Preserves table structure** - Uses DELETE, not DROP TABLE, so indexes and schema remain intact
+6. **Triggers a fresh snapshot** - After cleanup, proceeds with normal snapshot flow
 
 #### Configuration
 
@@ -560,6 +579,7 @@ snapshot:
   enabled: true
   mode: initial
   resnapshot: true  # Clean metadata and reprocess snapshot
+  resnapshotId: rebuild-2026-07-18
   chunkSize: 10000
 ```
 
@@ -592,6 +612,7 @@ snapshot:
   enabled: true
   mode: initial
   resnapshot: true
+  resnapshotId: corrected-customer-data-v1
 
 # Step 3: After successful reprocessing, set back to false
 snapshot:
@@ -703,55 +724,6 @@ In this example:
 
 ---
 
-#### Configuration
-
-```yaml
-snapshot:
-  enabled: true
-  mode: initial
-  forceResnapshot: true  # Clean metadata and reprocess snapshot
-  chunkSize: 10000
-```
-
-#### Use Cases
-
-- **Schema changes**: After adding/removing columns, reprocess to capture new structure
-- **Data corrections**: After fixing data issues in source, rebuild downstream
-- **Disaster recovery**: Rebuild downstream systems from scratch
-- **Testing**: Repeatedly test snapshot behavior during development
-
-#### Multi-Connector Safety
-
-If multiple teams use different connectors (slots) on the same database:
-
-```
-Database: shared_db
-├── Team A: slot_name = "team_a_slot"  ← forceResnapshot only affects this
-├── Team B: slot_name = "team_b_slot"  ← Unaffected
-└── Team C: slot_name = "team_c_slot"  ← Unaffected
-```
-
-**Important**: `forceResnapshot` only deletes metadata WHERE `slot_name = '<your_slot>'`. Other connectors' data remains intact.
-
-#### Example: Reprocessing After Data Fix
-
-```yaml
-# Step 1: Fix data in source database
-# Step 2: Deploy with forceResnapshot=true
-snapshot:
-  enabled: true
-  mode: initial
-  forceResnapshot: true
-
-# Step 3: After successful reprocessing, set back to false
-snapshot:
-  enabled: true
-  mode: initial
-  forceResnapshot: false  # Normal operation
-```
-
----
-
 ### Snapshot Modes
 
 #### `initial` Mode
@@ -763,7 +735,7 @@ snapshot:
 - Checks if job is already completed
 - If completed, skips snapshot and goes directly to CDC
 - **Recommended for production**
-- Use `resnapshot: true` to override and reprocess
+- Use `resnapshot: true` with a new `resnapshotId` to override and reprocess
 
 #### `never` Mode
 ```yaml
@@ -919,7 +891,7 @@ if acquired {
 
 **Key Points:**
 - Uses PostgreSQL advisory locks for coordination
-- Lock is held during setup phase only
+- The coordinator holds the lock until its snapshot resources close
 - Advisory locks are automatically released on connection close
 - Workers wait for coordinator by polling job metadata
 
@@ -936,10 +908,10 @@ currentLSN := SELECT pg_current_wal_lsn()  // e.g., "0/12345678"
 // 2. Start transaction (REPEATABLE READ for consistency)
 BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ
 
-// 3. Export snapshot and cache the ID
+// 3. Export the snapshot ID used by worker transactions
 snapshotID := SELECT pg_export_snapshot()  
 // Returns: "00000003-00000002-1"
-cachedSnapshotID = snapshotID  // Cache for metadata creation
+// The same value is persisted with the atomically published work plan.
 
 // 4. Keep transaction OPEN!
 // (Do NOT commit/rollback yet)
@@ -947,8 +919,8 @@ cachedSnapshotID = snapshotID  // Cache for metadata creation
 ```
 
 **Connection lifecycle safety (important):**
-- The coordinator runs a periodic keepalive (`SELECT 1`) only while the snapshot transaction is active.
-- On snapshot finalization or shutdown, keepalive is stopped first, then the export transaction is finalized (`COMMIT` on success, `ROLLBACK` on abnormal termination), and finally the export connection is closed.
+- Chunk planning completes before the coordinator starts the periodic keepalive (`SELECT 1`), so both never use the export connection concurrently.
+- On snapshot finalization or shutdown, keepalive is stopped first, the read-only export transaction is rolled back, and the export connection is closed.
 - This ordering prevents leaked `idle in transaction` sessions and avoids long-lived open transactions that can block `VACUUM`.
 
 **Critical: Why Keep Transaction Open?**
@@ -972,7 +944,7 @@ cachedSnapshotID = snapshotID  // Cache for metadata creation
 │  │  │ SELECT * FROM orders ... (sees same data!)   │ │    │
 │  │  └──────────────────────────────────────────────┘ │    │
 │  │                                                     │    │
-│  │ COMMIT (after all chunks done)                     │    │
+│  │ ROLLBACK (after all chunks done)                   │    │
 │  └────────────────────────────────────────────────┘    │
 └─────────────────────────────────────────────────────────────┘
 
@@ -1059,7 +1031,7 @@ SELECT * FROM users WHERE id >= 1 AND id <= 10000;
 -- CTID Block:
 SELECT * FROM users WHERE ctid >= '(0,0)'::tid AND ctid < '(100,0)'::tid;
 
--- Offset (slow fallback):
+-- Offset (explicit, slow):
 SELECT * FROM users ORDER BY id LIMIT 10000 OFFSET 0;
 ```
 
@@ -1171,23 +1143,17 @@ allDone := SELECT COUNT(*) = COUNT(*) FILTER (WHERE status = 'completed')
            WHERE slot_name = 'cdc_slot'
 
 if allDone {
-    // 2. Mark job as completed
-    UPDATE cdc_snapshot_job
-    SET completed = true
-    WHERE slot_name = 'cdc_slot'
-    
-    // 3. Close snapshot transaction
-    COMMIT  // (on coordinator's export connection)
-    
-    // 4. Send END marker
+    // 2. Send END marker and atomically mark the job completed
     handler(&format.Snapshot{
         EventType: format.SnapshotEventTypeEnd,
         LSN:       snapshotLSN,
     })
-    
-    // 5. Start CDC from snapshot LSN
+
+    // 3. Stop keepalive and close the read-only export transaction
+    ROLLBACK
+
+    // 4. Start CDC from the conservative checkpoint
     START_REPLICATION SLOT cdc_slot LOGICAL 0/12345678
-    // CDC stream starts from where snapshot was taken
 }
 ```
 
@@ -1195,7 +1161,7 @@ if allDone {
 - Snapshot finalization always stops the keepalive loop before closing the export transaction.
 - This guarantees there is no background `SELECT 1` running on a finalized connection.
 
-**No Duplicate Data:**
+**At-Least-Once Handoff:**
 
 ```
 Timeline:
@@ -1208,10 +1174,15 @@ Timeline:
          ├────────────────────┤────────────────────►
          │   Snapshot Data    │    CDC Data        │
          │   (goes to handler)│  (goes to handler) │
-         │                    │                    │
-         │◄───────────────────┤                    │
-         No overlap!    CDC starts from snapshot LSN
+         │              ◄─────┤                    │
+         │        possible overlap, never a gap    │
 ```
+
+The replication slot retains WAL before snapshot preparation, and the CDC
+checkpoint is captured before the exported snapshot is acquired. This ordering
+is fail-safe: a concurrent transaction can be replayed after already appearing
+in the snapshot, but it cannot be absent from both phases. Consumers should use
+idempotent upserts or their own event deduplication.
 
 ### Partitioning Strategies
 
@@ -1223,7 +1194,7 @@ The snapshot feature automatically selects the most efficient partitioning strat
 |----------|----------|-------------|---------------|
 | **Integer Range** | Sequential integer PKs (id, serial) | ⚡ Fastest | `WHERE id >= X AND id <= Y` |
 | **CTID Block** | String/UUID PKs, hash-based PKs, any table | 🚀 Very Fast | `WHERE ctid >= '(block,0)'::tid` |
-| **Offset** | Fallback when others fail | 🐌 Slow | `ORDER BY pk LIMIT X OFFSET Y` |
+| **Offset** | Explicit compatibility strategy | 🐌 Slow | `ORDER BY pk LIMIT X OFFSET Y` |
 
 #### 1. Integer Range Partitioning
 
@@ -1958,7 +1929,7 @@ publication:
 - `auto` (default): Auto-detect best strategy
 - `integer_range`: For sequential integer PKs
 - `ctid_block`: For string/UUID/hash PKs
-- `offset`: Slow fallback (not recommended)
+- `offset`: Explicit LIMIT/OFFSET strategy (slow; not recommended)
 
 ### Q: What happens if I add a new table to publication during snapshot?
 

@@ -2,6 +2,7 @@ package replication
 
 import (
 	"encoding/binary"
+	"errors"
 	"log/slog"
 	"testing"
 
@@ -38,6 +39,12 @@ func TestHandleXLogDataRejectsMalformedRow(t *testing.T) {
 	)
 
 	assert.Error(t, err)
+}
+
+func TestIgnorableLogicalMetadataRequiresUnsupportedSentinel(t *testing.T) {
+	assert.True(t, ignorableLogicalMetadata([]byte{byte(message.TypeByte)}, message.ErrorByteNotSupported))
+	assert.False(t, ignorableLogicalMetadata([]byte{byte(message.TypeByte)}, errors.New("malformed metadata")))
+	assert.False(t, ignorableLogicalMetadata([]byte{byte(message.InsertByte)}, message.ErrorByteNotSupported))
 }
 
 func testXLogData(walEnd pq.LSN, logicalMessage []byte) []byte {

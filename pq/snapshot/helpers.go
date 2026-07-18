@@ -2,212 +2,95 @@ package snapshot
 
 import (
 	"context"
-	goerrors "errors"
-	"net"
+	"fmt"
 	"strconv"
 	"strings"
-	"syscall"
-	"time"
 
-	"github.com/Trendyol/go-pq-cdc/logger"
 	"github.com/Trendyol/go-pq-cdc/pq"
-	"github.com/go-playground/errors"
-	"github.com/jackc/pgx/v5/pgconn"
 )
 
-// Time format constants for PostgreSQL timestamp formatting
 const (
 	postgresTimestampFormat       = "2006-01-02 15:04:05"
 	postgresTimestampFormatMicros = "2006-01-02 15:04:05.999999"
 )
 
-// execSQL executes a SQL statement without returning results (DDL, DML)
-func (s *Snapshotter) execSQL(ctx context.Context, conn pq.Connection, sql string) error {
-	return pq.ExecSQL(ctx, conn, sql)
-}
-
-// execQuery executes a SQL query and returns results
-// Query should be pre-formatted (use fmt.Sprintf before calling)
-func (s *Snapshotter) execQuery(ctx context.Context, conn pq.Connection, query string) ([]*pgconn.Result, error) {
-	resultReader := conn.Exec(ctx, query)
-	results, err := resultReader.ReadAll()
-	if err != nil {
-		return nil, err
+func withTransaction(ctx context.Context, conn pq.Connection, fn func(pq.Connection) error) error {
+	if err := pq.ExecSQL(ctx, conn, "BEGIN"); err != nil {
+		return fmt.Errorf("begin transaction: %w", err)
 	}
-	if err = resultReader.Close(); err != nil {
-		return nil, err
-	}
-	return results, nil
-}
-
-// retryDBOperation retries a database operation on transient errors
-func (s *Snapshotter) retryDBOperation(ctx context.Context, operation func() error) error {
-	maxRetries := 3
-	retryDelay := 1 * time.Second
-
-	var lastErr error
-	for attempt := 0; attempt < maxRetries; attempt++ {
-		if attempt > 0 {
-			// Exponential backoff
-			delay := retryDelay * time.Duration(1<<uint(attempt-1))
-			logger.Debug("[retry] database operation", "attempt", attempt, "delay", delay)
-
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-time.After(delay):
-			}
+	committed := false
+	defer func() {
+		if committed {
+			return
 		}
+		rollbackCtx, cancel := context.WithTimeout(context.Background(), snapshotCleanupTimeout)
+		defer cancel()
+		_ = pq.ExecSQL(rollbackCtx, conn, "ROLLBACK")
+	}()
 
-		err := operation()
-		if err == nil {
-			return nil
-		}
-
-		// Check if error is transient (network, connection, timeout)
-		if isTransientError(err) {
-			lastErr = err
-			continue
-		}
-
-		// Non-transient error, fail immediately
+	if err := fn(conn); err != nil {
 		return err
 	}
-
-	return errors.Wrap(lastErr, "database operation failed after retries")
+	if err := pq.ExecSQL(ctx, conn, "COMMIT"); err != nil {
+		return fmt.Errorf("commit transaction: %w", err)
+	}
+	committed = true
+	return nil
 }
 
-// getSnapshotColumns returns the list of columns for a given table from the publication configuration
 func (s *Snapshotter) getSnapshotColumns(schema, name string) []string {
-	for _, t := range s.tables {
-		if t.Schema == schema && t.Name == name {
-			return t.Columns
+	schema = normalizeSchema(schema)
+	for _, table := range s.tables {
+		if normalizeSchema(table.Schema) == schema && table.Name == name {
+			return table.Columns
 		}
 	}
 	return nil
 }
 
-// isTransientError checks if an error is transient and should be retried
-func isTransientError(err error) bool {
-	if err == nil {
-		return false
+func normalizeSchema(schema string) string {
+	if schema == "" {
+		return "public"
 	}
-
-	// 1. Check for context errors (deadline exceeded, canceled)
-	if goerrors.Is(err, context.DeadlineExceeded) || goerrors.Is(err, context.Canceled) {
-		return true
-	}
-
-	// 2. Check for pgconn connection errors
-	// These occur during initial connection or when connection is lost
-	var connectErr *pgconn.ConnectError
-	if goerrors.As(err, &connectErr) {
-		return true
-	}
-
-	// 3. Check for PostgreSQL-specific transient errors
-	// Reference: https://www.postgresql.org/docs/current/errcodes-appendix.html
-	var pgErr *pgconn.PgError
-	if goerrors.As(err, &pgErr) {
-		switch pgErr.Code {
-		case "40001": // serialization_failure
-			return true
-		case "40P01": // deadlock_detected
-			return true
-		case "55006": // object_in_use
-			return true
-		case "55P03": // lock_not_available
-			return true
-		case "57P03": // cannot_connect_now
-			return true
-		case "58000": // system_error
-			return true
-		case "58030": // io_error
-			return true
-		}
-	}
-
-	// 4. Check for Go's standard network timeout errors
-	var timeoutErr interface{ Timeout() bool }
-	if goerrors.As(err, &timeoutErr) && timeoutErr.Timeout() {
-		return true
-	}
-
-	// 5. Check for Go's standard temporary network errors
-	var tempErr interface{ Temporary() bool }
-	if goerrors.As(err, &tempErr) && tempErr.Temporary() {
-		return true
-	}
-
-	// 6. Check for specific syscall errors (low-level network errors)
-	var netErr *net.OpError
-	if goerrors.As(err, &netErr) {
-		// ECONNREFUSED, ECONNRESET, EPIPE are transient
-		if goerrors.Is(netErr.Err, syscall.ECONNREFUSED) ||
-			goerrors.Is(netErr.Err, syscall.ECONNRESET) ||
-			goerrors.Is(netErr.Err, syscall.EPIPE) {
-			return true
-		}
-	}
-
-	// 7. Fallback to string matching for edge cases not covered above
-	// This is kept minimal as a safety net
-	errStr := strings.ToLower(err.Error())
-	if strings.Contains(errStr, "connection closed") ||
-		strings.Contains(errStr, "connection lost") {
-		return true
-	}
-
-	return false
+	return schema
 }
 
-// isInvalidSnapshotError checks if an error is due to invalid snapshot identifier
-// This occurs when the coordinator's snapshot transaction is closed/expired
-// Common in multi-pod deployments when coordinator restarts
-func isInvalidSnapshotError(err error) bool {
-	if err == nil {
-		return false
+func nullableInt64SQL(value *int64) string {
+	if value == nil {
+		return "NULL"
 	}
-
-	// Check for PostgreSQL error code 22023 (invalid_parameter_value) with snapshot message
-	var pgErr *pgconn.PgError
-	if goerrors.As(err, &pgErr) {
-		if pgErr.Code == "22023" && strings.Contains(strings.ToLower(pgErr.Message), "invalid snapshot identifier") {
-			return true
-		}
-	}
-
-	// Fallback to string matching
-	errStr := strings.ToLower(err.Error())
-	return strings.Contains(errStr, "invalid snapshot identifier")
+	return strconv.FormatInt(*value, 10)
 }
 
 func parseNullableInt64(value []byte) (*int64, error) {
 	if value == nil {
 		return nil, nil
 	}
-
-	str := string(value)
-	if str == "" {
-		return nil, nil
-	}
-
-	parsed, err := strconv.ParseInt(str, 10, 64)
+	parsed, err := strconv.ParseInt(string(value), 10, 64)
 	if err != nil {
 		return nil, err
 	}
-
 	return &parsed, nil
 }
 
-// helper function to format column list for snapshot queries
-func selectSnapshotColumns(columns []string) string {
-	if len(columns) > 0 {
-		quotedColumns := make([]string, 0, len(columns))
-		for _, column := range columns {
-			quotedColumns = append(quotedColumns, pq.QuoteIdentifier(column))
-		}
-		return strings.Join(quotedColumns, ", ")
+func parsePostgresBool(value []byte) (bool, error) {
+	switch string(value) {
+	case "t", "true":
+		return true, nil
+	case "f", "false":
+		return false, nil
+	default:
+		return false, fmt.Errorf("invalid PostgreSQL boolean %q", value)
 	}
-	return "*"
+}
+
+func selectSnapshotColumns(columns []string) string {
+	if len(columns) == 0 {
+		return "*"
+	}
+	quoted := make([]string, len(columns))
+	for i, column := range columns {
+		quoted[i] = pq.QuoteIdentifier(column)
+	}
+	return strings.Join(quoted, ", ")
 }

@@ -2,11 +2,12 @@ package snapshot
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/Trendyol/go-pq-cdc/pq"
-	"github.com/go-playground/errors"
 )
 
 // ChunkStatus represents the status of a chunk
@@ -24,7 +25,7 @@ type PartitionStrategy string
 const (
 	PartitionStrategyIntegerRange PartitionStrategy = "integer_range" // Single integer PK - MIN/MAX range
 	PartitionStrategyCTIDBlock    PartitionStrategy = "ctid_block"    // Physical block-based partitioning
-	PartitionStrategyOffset       PartitionStrategy = "offset"        // Fallback - LIMIT/OFFSET
+	PartitionStrategyOffset       PartitionStrategy = "offset"        // LIMIT/OFFSET
 )
 
 // Chunk represents a unit of work for snapshot processing
@@ -37,7 +38,7 @@ type Chunk struct {
 
 	// CTID block partitioning fields
 	BlockStart *int64
-	BlockEnd   *int64 // nil for last chunk (no upper bound to catch new rows)
+	BlockEnd   *int64 // nil for the final unbounded chunk
 
 	Status            ChunkStatus
 	PartitionStrategy PartitionStrategy
@@ -50,11 +51,69 @@ type Chunk struct {
 	ChunkIndex        int
 	ChunkStart        int64
 	ChunkSize         int64
-	IsLastChunk       bool // True for the last chunk of a table (no upper bound for CTID)
+	IsLastChunk       bool
 }
 
 func (c *Chunk) hasRangeBounds() bool {
 	return c.RangeStart != nil && c.RangeEnd != nil
+}
+
+func (c *Chunk) validatePartition() error {
+	if c.ChunkSize <= 0 {
+		return errors.New("chunk size must be positive")
+	}
+	if c.ChunkIndex < 0 || c.ChunkStart < 0 {
+		return errors.New("chunk position must not be negative")
+	}
+
+	switch c.PartitionStrategy {
+	case PartitionStrategyIntegerRange:
+		if c.BlockStart != nil || c.BlockEnd != nil || c.IsLastChunk {
+			return errors.New("integer-range chunk contains CTID metadata")
+		}
+		if (c.RangeStart == nil) != (c.RangeEnd == nil) {
+			return errors.New("integer-range chunk has incomplete bounds")
+		}
+		if !c.hasRangeBounds() && (c.ChunkIndex != 0 || c.ChunkStart != 0) {
+			return errors.New("empty integer-range chunk has inconsistent position")
+		}
+		if c.hasRangeBounds() && *c.RangeStart > *c.RangeEnd {
+			return errors.New("integer-range chunk start exceeds end")
+		}
+		if c.hasRangeBounds() {
+			maxEnd := *c.RangeStart + c.ChunkSize - 1
+			if maxEnd >= *c.RangeStart && *c.RangeEnd > maxEnd {
+				return errors.New("integer-range chunk exceeds its row limit")
+			}
+		}
+	case PartitionStrategyCTIDBlock:
+		if c.RangeStart != nil || c.RangeEnd != nil {
+			return errors.New("CTID chunk contains integer-range metadata")
+		}
+		if c.BlockStart == nil {
+			if c.BlockEnd != nil || c.IsLastChunk || c.ChunkIndex != 0 || c.ChunkStart != 0 {
+				return errors.New("empty CTID chunk has inconsistent bounds")
+			}
+			return nil
+		}
+		if *c.BlockStart < 0 {
+			return errors.New("CTID block start must not be negative")
+		}
+		if c.IsLastChunk {
+			if c.BlockEnd != nil {
+				return errors.New("last CTID chunk must not have an upper bound")
+			}
+		} else if c.BlockEnd == nil || *c.BlockEnd <= *c.BlockStart {
+			return errors.New("bounded CTID chunk has invalid upper bound")
+		}
+	case PartitionStrategyOffset:
+		if c.RangeStart != nil || c.RangeEnd != nil || c.BlockStart != nil || c.BlockEnd != nil || c.IsLastChunk {
+			return errors.New("offset chunk contains range metadata")
+		}
+	default:
+		return fmt.Errorf("unknown snapshot partition strategy %q", c.PartitionStrategy)
+	}
+	return nil
 }
 
 // Job represents the overall snapshot job metadata
@@ -62,131 +121,143 @@ type Job struct {
 	StartedAt       time.Time
 	SlotName        string
 	SnapshotID      string
+	ResnapshotID    string
 	SnapshotLSN     pq.LSN
 	TotalChunks     int
 	CompletedChunks int
 	Completed       bool
 }
 
-const (
-	jobTableName    = "cdc_snapshot_job"
-	chunksTableName = "cdc_snapshot_chunks"
-)
-
-// loadJob loads the job metadata
-func (s *Snapshotter) loadJob(ctx context.Context, slotName string) (*Job, error) {
-	var job *Job
-
-	err := s.retryDBOperation(ctx, func() error {
-		query := fmt.Sprintf(`
-			SELECT slot_name, snapshot_id, snapshot_lsn, started_at, 
-			       completed, total_chunks, completed_chunks
-			FROM %s WHERE slot_name = '%s'
-		`, jobTableName, slotName)
-
-		results, err := s.execQuery(ctx, s.metadataConn, query)
-		if err != nil {
-			return errors.Wrap(err, "load job")
-		}
-
-		if len(results) == 0 || len(results[0].Rows) == 0 {
-			job = nil
-			return nil // Not found (not an error)
-		}
-
-		row := results[0].Rows[0]
-		if len(row) < 7 {
-			return errors.New("invalid job row")
-		}
-
-		job = &Job{
-			SlotName:   string(row[0]),
-			SnapshotID: string(row[1]),
-		}
-
-		// Parse LSN
-		job.SnapshotLSN, err = pq.ParseLSN(string(row[2]))
-		if err != nil {
-			return errors.Wrap(err, "parse snapshot LSN")
-		}
-
-		// Parse timestamp
-		job.StartedAt, err = parseTimestamp(string(row[3]))
-		if err != nil {
-			return errors.Wrap(err, "parse started_at timestamp")
-		}
-
-		job.Completed = string(row[4]) == "t" || string(row[4]) == "true"
-		if _, err := fmt.Sscanf(string(row[5]), "%d", &job.TotalChunks); err != nil {
-			return errors.Wrap(err, "parse total chunks")
-		}
-		if _, err := fmt.Sscanf(string(row[6]), "%d", &job.CompletedChunks); err != nil {
-			return errors.Wrap(err, "parse completed chunks")
-		}
-
-		return nil
-	})
-
-	return job, err
+func (j *Job) sqlIdentity(alias string) string {
+	if alias != "" {
+		alias += "."
+	}
+	return fmt.Sprintf(
+		"%sslot_name = %s AND %ssnapshot_id = %s",
+		alias,
+		pq.QuoteLiteral(j.SlotName),
+		alias,
+		pq.QuoteLiteral(j.SnapshotID),
+	)
 }
 
-// LoadJob is the public API for connector
+func (s *Snapshotter) validateJobRequest(job *Job) error {
+	if s.config.Resnapshot && job.ResnapshotID != s.config.ResnapshotID {
+		return fmt.Errorf("%w: expected %q, got %q", ErrResnapshotSuperseded, s.config.ResnapshotID, job.ResnapshotID)
+	}
+	return nil
+}
+
+func (j *Job) validate() error {
+	if j.SlotName == "" || j.SnapshotID == "" {
+		return errors.New("invalid snapshot job identity")
+	}
+	if j.SnapshotLSN == 0 {
+		return errors.New("snapshot LSN must not be 0/0")
+	}
+	if j.StartedAt.IsZero() {
+		return errors.New("snapshot job start time is required")
+	}
+	if j.TotalChunks <= 0 || j.CompletedChunks < 0 || j.CompletedChunks > j.TotalChunks {
+		return errors.New("invalid snapshot job progress")
+	}
+	if j.Completed && j.CompletedChunks != j.TotalChunks {
+		return errors.New("completed snapshot job has unfinished chunks")
+	}
+	return nil
+}
+
+const (
+	jobTableName     = "cdc_snapshot_job"
+	chunksTableName  = "cdc_snapshot_chunks"
+	requestTableName = "cdc_snapshot_request"
+)
+
+func (s *Snapshotter) loadJob(ctx context.Context, slotName string) (*Job, error) {
+	query := fmt.Sprintf(`
+		SELECT slot_name, snapshot_id, resnapshot_id, snapshot_lsn, started_at,
+		       completed, total_chunks, completed_chunks
+		FROM %s WHERE slot_name = %s
+	`, jobTableName, pq.QuoteLiteral(slotName))
+	results, err := pq.ExecQuery(ctx, s.metadataConn, query)
+	if err != nil {
+		return nil, fmt.Errorf("load job: %w", err)
+	}
+	if len(results) != 1 {
+		return nil, errors.New("invalid snapshot job result")
+	}
+	rows := results[0].Rows
+	if len(rows) == 0 {
+		return nil, nil
+	}
+	if len(rows) != 1 {
+		return nil, errors.New("invalid snapshot job row")
+	}
+	return parseJobRow(rows[0], slotName)
+}
+
+func parseJobRow(row [][]byte, slotName string) (*Job, error) {
+	if len(row) != 8 {
+		return nil, errors.New("invalid snapshot job row")
+	}
+
+	job := &Job{SlotName: string(row[0]), SnapshotID: string(row[1]), ResnapshotID: string(row[2])}
+	if job.SlotName != slotName {
+		return nil, errors.New("invalid snapshot job identity")
+	}
+
+	var err error
+	job.SnapshotLSN, err = pq.ParseLSN(string(row[3]))
+	if err != nil {
+		return nil, fmt.Errorf("parse snapshot LSN: %w", err)
+	}
+	job.StartedAt, err = parseTimestamp(string(row[4]))
+	if err != nil {
+		return nil, fmt.Errorf("parse started_at timestamp: %w", err)
+	}
+	job.Completed, err = parsePostgresBool(row[5])
+	if err != nil {
+		return nil, fmt.Errorf("parse snapshot completion flag: %w", err)
+	}
+	job.TotalChunks, err = strconv.Atoi(string(row[6]))
+	if err != nil {
+		return nil, fmt.Errorf("parse total chunks: %w", err)
+	}
+	job.CompletedChunks, err = strconv.Atoi(string(row[7]))
+	if err != nil {
+		return nil, fmt.Errorf("parse completed chunks: %w", err)
+	}
+	if err := job.validate(); err != nil {
+		return nil, err
+	}
+	return job, nil
+}
+
+// LoadJob is the public API for connector.
 func (s *Snapshotter) LoadJob(ctx context.Context, slotName string) (*Job, error) {
 	return s.loadJob(ctx, slotName)
 }
 
-// checkJobCompleted checks if all chunks are completed
-func (s *Snapshotter) checkJobCompleted(ctx context.Context, slotName string) (bool, error) {
-	var isCompleted bool
-
-	err := s.retryDBOperation(ctx, func() error {
-		query := fmt.Sprintf(`
-			SELECT 
-				COUNT(*) as total,
-				COUNT(*) FILTER (WHERE status = 'completed') as completed
-			FROM %s
-			WHERE slot_name = '%s'
-		`, chunksTableName, slotName)
-
-		results, err := s.execQuery(ctx, s.metadataConn, query)
-		if err != nil {
-			return errors.Wrap(err, "check job completed")
-		}
-
-		if len(results) == 0 || len(results[0].Rows) == 0 {
-			isCompleted = false
-			return nil
-		}
-
-		row := results[0].Rows[0]
-		var total, completed int
-		if _, err := fmt.Sscanf(string(row[0]), "%d", &total); err != nil {
-			return errors.Wrap(err, "parse total count")
-		}
-		if _, err := fmt.Sscanf(string(row[1]), "%d", &completed); err != nil {
-			return errors.Wrap(err, "parse completed count")
-		}
-
-		isCompleted = total > 0 && total == completed
-		return nil
-	})
-
-	return isCompleted, err
+func (s *Snapshotter) checkJobCompleted(ctx context.Context, expected *Job) (bool, error) {
+	job, err := s.loadJob(ctx, expected.SlotName)
+	if err != nil {
+		return false, err
+	}
+	if job == nil {
+		return false, ErrSnapshotInvalidated
+	}
+	if job.SnapshotID != expected.SnapshotID {
+		return false, ErrSnapshotInvalidated
+	}
+	return job.CompletedChunks == job.TotalChunks, nil
 }
 
-// Helper functions
-
 func parseTimestamp(s string) (time.Time, error) {
-	formats := []string{
-		postgresTimestampFormatMicros,
-		postgresTimestampFormat,
+	if t, err := time.Parse(postgresTimestampFormatMicros, s); err == nil {
+		return t, nil
 	}
-
-	for _, format := range formats {
-		if t, err := time.Parse(format, s); err == nil {
-			return t, nil
-		}
+	if t, err := time.Parse(postgresTimestampFormat, s); err == nil {
+		return t, nil
 	}
-
-	return time.Time{}, fmt.Errorf("unable to parse timestamp: %s", s)
+	return time.Time{}, fmt.Errorf("unable to parse timestamp %q", s)
 }

@@ -3,26 +3,31 @@ package pq
 import (
 	"context"
 	"fmt"
+
+	"github.com/jackc/pgx/v5/pgconn"
 )
+
+// ExecQuery executes SQL and always closes its result reader.
+func ExecQuery(ctx context.Context, conn Connection, sql string) ([]*pgconn.Result, error) {
+	reader := conn.Exec(ctx, sql)
+	results, readErr := reader.ReadAll()
+	closeErr := reader.Close()
+	if readErr != nil {
+		return nil, readErr
+	}
+	return results, closeErr
+}
 
 // ExecSQL executes a SQL statement without returning results.
 func ExecSQL(ctx context.Context, conn Connection, sql string) error {
-	resultReader := conn.Exec(ctx, sql)
-	_, err := resultReader.ReadAll()
-	if err != nil {
-		return err
-	}
-	return resultReader.Close()
+	_, err := ExecQuery(ctx, conn, sql)
+	return err
 }
 
 // ExecExistsQuery executes a SELECT EXISTS query and returns the boolean result.
 func ExecExistsQuery(ctx context.Context, conn Connection, query string) (bool, error) {
-	resultReader := conn.Exec(ctx, query)
-	results, err := resultReader.ReadAll()
+	results, err := ExecQuery(ctx, conn, query)
 	if err != nil {
-		return false, err
-	}
-	if err := resultReader.Close(); err != nil {
 		return false, err
 	}
 
@@ -42,6 +47,20 @@ func TableExists(ctx context.Context, conn Connection, schema, table string) (bo
 			WHERE table_schema = %s
 			AND table_name = %s
 		)`, QuoteLiteral(schema), QuoteLiteral(table))
+
+	return ExecExistsQuery(ctx, conn, query)
+}
+
+// ColumnExists checks whether a table column exists in the given schema.
+func ColumnExists(ctx context.Context, conn Connection, schema, table, column string) (bool, error) {
+	query := fmt.Sprintf(`
+		SELECT EXISTS (
+			SELECT 1
+			FROM information_schema.columns
+			WHERE table_schema = %s
+			AND table_name = %s
+			AND column_name = %s
+		)`, QuoteLiteral(schema), QuoteLiteral(table), QuoteLiteral(column))
 
 	return ExecExistsQuery(ctx, conn, query)
 }

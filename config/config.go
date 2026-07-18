@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -369,6 +370,7 @@ type SnapshotConfig struct {
 	HeartbeatInterval time.Duration      `json:"heartbeatInterval" yaml:"heartbeatInterval"`
 	Enabled           bool               `json:"enabled" yaml:"enabled"`
 	Resnapshot        bool               `json:"resnapshot" yaml:"resnapshot"`
+	ResnapshotID      string             `json:"resnapshotId,omitempty" yaml:"resnapshotId,omitempty"`
 }
 
 func (s *SnapshotConfig) Validate() error {
@@ -376,15 +378,9 @@ func (s *SnapshotConfig) Validate() error {
 		return nil
 	}
 
-	validModes := []SnapshotMode{SnapshotModeInitial, SnapshotModeNever, SnapshotModeSnapshotOnly}
-	isValid := false
-	for _, mode := range validModes {
-		if s.Mode == mode {
-			isValid = true
-			break
-		}
-	}
-	if !isValid {
+	switch s.Mode {
+	case SnapshotModeInitial, SnapshotModeNever, SnapshotModeSnapshotOnly:
+	default:
 		return errors.New("snapshot mode must be 'initial', 'never', or 'snapshot_only'")
 	}
 
@@ -401,6 +397,9 @@ func (s *SnapshotConfig) Validate() error {
 	if s.HeartbeatInterval > s.ClaimTimeout/2 {
 		return errors.New("snapshot heartbeat interval must not exceed half the claim timeout")
 	}
+	if s.Resnapshot && strings.TrimSpace(s.ResnapshotID) == "" {
+		return errors.New("snapshot.resnapshotId is required when resnapshot is enabled")
+	}
 
 	// For snapshot_only mode, tables must be specified
 	if s.Mode == SnapshotModeSnapshotOnly && len(s.Tables) == 0 {
@@ -412,10 +411,13 @@ func (s *SnapshotConfig) Validate() error {
 			return err
 		}
 	}
-	for _, t := range s.Tables {
-		if t.QueryCondition != "" {
-			if err := publication.ValidateQueryCondition(t.QueryCondition); err != nil {
-				return fmt.Errorf("snapshot.tables %s.%s: %w", t.Schema, t.Name, err)
+	for _, table := range s.Tables {
+		if !slices.Contains(publication.ValidSnapshotPartitionStrategies, table.SnapshotPartitionStrategy) {
+			return fmt.Errorf("snapshot.tables %s.%s: undefined snapshot partition strategy %q", table.Schema, table.Name, table.SnapshotPartitionStrategy)
+		}
+		if table.QueryCondition != "" {
+			if err := publication.ValidateQueryCondition(table.QueryCondition); err != nil {
+				return fmt.Errorf("snapshot.tables %s.%s: %w", table.Schema, table.Name, err)
 			}
 		}
 	}

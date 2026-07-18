@@ -65,6 +65,7 @@ func cleanupSnapshotTest(t *testing.T, ctx context.Context, tableName string, sl
 	// Clean metadata tables (if they exist)
 	_ = pgExec(ctx, conn, fmt.Sprintf("DELETE FROM cdc_snapshot_chunks WHERE slot_name = '%s'", slotName))
 	_ = pgExec(ctx, conn, fmt.Sprintf("DELETE FROM cdc_snapshot_job WHERE slot_name = '%s'", slotName))
+	_ = pgExec(ctx, conn, fmt.Sprintf("DELETE FROM cdc_snapshot_request WHERE slot_name = '%s'", slotName))
 
 	// Drop publication and slot
 	_ = pgExec(ctx, conn, fmt.Sprintf("DROP PUBLICATION IF EXISTS %s", publicationName))
