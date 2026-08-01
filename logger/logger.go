@@ -6,7 +6,7 @@ import (
 	"sync"
 )
 
-var _default Logger
+var _default Logger = slog.Default()
 
 type Logger interface {
 	Debug(msg string, args ...any)
