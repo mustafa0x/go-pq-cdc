@@ -24,7 +24,7 @@ type ListenerContext struct {
     WALStart pq.LSN
 
     // AckLSN is the checkpoint associated with this message. In
-    // transaction-aware mode, only Commit and StreamCommit acknowledgements
+    // transaction-aware mode, only Commit acknowledgements
     // advance confirmed_flush_lsn.
     AckLSN pq.LSN
 
@@ -40,9 +40,11 @@ For a regular transaction the listener receives, in WAL order:
 2. decoded row and metadata messages emitted by PostgreSQL
 3. `*format.Commit`
 
-For a streamed transaction, messages are buffered by XID and are not delivered until PostgreSQL emits `StreamCommit`. The buffered messages are then delivered in order, followed by `*format.StreamCommit`. `StreamAbort` discards the buffered transaction.
+For a streamed transaction, messages are buffered by XID and are not delivered until PostgreSQL emits `StreamCommit`. The listener then receives a synthesized `*format.Begin`, the buffered messages in order, and an ordinary `*format.Commit`. `StreamAbort` discards the buffered transaction.
 
 Rolled-back transactions do not produce a commit boundary.
+
+Transactional logical messages remain inside that boundary and are discarded with an aborted streamed transaction. Nontransactional logical messages are internal ordered checkpoints in this mode; row-oriented mode delivers them to the listener.
 
 Malformed or unsupported replication messages terminate the stream. They are not skipped, because skipping a row and later acknowledging its commit would make a partial projection durable.
 
@@ -52,7 +54,7 @@ When transaction-aware mode is disabled, `Ack()` keeps the existing row-oriented
 
 When transaction-aware mode is enabled:
 
-- `Ack()` on `Commit` and `StreamCommit` marks that transaction checkpoint durable.
+- `Ack()` on `Commit` marks that transaction checkpoint durable.
 - Commit acknowledgements are ordered. A later acknowledged commit cannot advance `confirmed_flush_lsn` past an earlier unacknowledged commit.
 - `Ack()` on rows and metadata does not advance the confirmed LSN. Replication feedback remains coalesced by the stream loop.
 - Feedback writes are owned by the stream sink. A socket-write failure terminates the stream and is returned from `Connector.Start`; it is not reported synchronously by `Ack()`.

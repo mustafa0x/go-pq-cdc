@@ -223,8 +223,9 @@ func TestPublicationColumnListCreateAndInfo(t *testing.T) {
 	assert.True(t, found, "books table should be in the publication")
 }
 
-// TestPublicationColumnListValidation verifies that specifying columns with
-// FULL replica identity is rejected by validation.
+// TestPublicationColumnListValidation verifies that an explicit all-column
+// list may be paired with FULL replica identity. Capture-plan compilation
+// later proves that every replica-identity column is actually present.
 func TestPublicationColumnListValidation(t *testing.T) {
 	table := publication.Table{
 		Name:            "books",
@@ -234,8 +235,7 @@ func TestPublicationColumnListValidation(t *testing.T) {
 	}
 
 	err := table.Validate()
-	require.Error(t, err, "columns with FULL replica identity should be rejected")
-	assert.Contains(t, err.Error(), "cannot specify columns when replica identity is FULL")
+	require.NoError(t, err)
 }
 
 // TestPublicationColumnListWithUpdatesAndDeletes verifies that update and

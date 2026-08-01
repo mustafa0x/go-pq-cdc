@@ -43,7 +43,7 @@ func NewInsert(data []byte, streamedTransaction bool, relation map[uint32]*Relat
 	msg.Decoded = make(map[string]any)
 
 	var err error
-	msg.Decoded, err = msg.TupleData.DecodeWithColumn(rel.Columns)
+	msg.Decoded, err = msg.TupleData.DecodeWithColumn(rel.Columns, InsertTupleDataType)
 	if err != nil {
 		return nil, err
 	}

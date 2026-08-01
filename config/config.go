@@ -1,18 +1,20 @@
 package config
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net"
 	"net/url"
-	"slices"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/Trendyol/go-pq-cdc/logger"
+	"github.com/Trendyol/go-pq-cdc/pq"
+	"github.com/Trendyol/go-pq-cdc/pq/capture"
 	"github.com/Trendyol/go-pq-cdc/pq/publication"
 	"github.com/Trendyol/go-pq-cdc/pq/slot"
 )
@@ -20,20 +22,18 @@ import (
 const defaultSchema = "public"
 
 type Config struct {
-	Logger           LoggerConfig       `json:"logger" yaml:"logger"`
-	Host             string             `json:"host" yaml:"host"`
-	Username         string             `json:"username" yaml:"username"`
-	Password         string             `json:"password" yaml:"password"`
-	Database         string             `json:"database" yaml:"database"`
-	Publication      publication.Config `json:"publication" yaml:"publication"`
-	Heartbeat        HeartbeatConfig    `json:"heartbeat" yaml:"heartbeat"`
-	Listener         ListenerConfig     `json:"listener" yaml:"listener"`
-	Slot             slot.Config        `json:"slot" yaml:"slot"`
-	Snapshot         SnapshotConfig     `json:"snapshot" yaml:"snapshot"`
-	Port             int                `json:"port" yaml:"port"`
-	Metric           MetricConfig       `json:"metric" yaml:"metric"`
-	DebugMode        bool               `json:"debugMode" yaml:"debugMode"`
-	ExtensionSupport ExtensionSupport   `json:"extensionSupport" yaml:"extensionSupport"`
+	Logger      LoggerConfig       `json:"logger" yaml:"logger"`
+	Host        string             `json:"host" yaml:"host"`
+	Username    string             `json:"username" yaml:"username"`
+	Password    string             `json:"password" yaml:"password"`
+	Database    string             `json:"database" yaml:"database"`
+	Publication publication.Config `json:"publication" yaml:"publication"`
+	Heartbeat   HeartbeatConfig    `json:"heartbeat" yaml:"heartbeat"`
+	Listener    ListenerConfig     `json:"listener" yaml:"listener"`
+	Slot        slot.Config        `json:"slot" yaml:"slot"`
+	Port        int                `json:"port" yaml:"port"`
+	Metric      MetricConfig       `json:"metric" yaml:"metric"`
+	DebugMode   bool               `json:"debugMode" yaml:"debugMode"`
 }
 
 type MetricConfig struct {
@@ -43,10 +43,6 @@ type MetricConfig struct {
 type LoggerConfig struct {
 	Logger   logger.Logger `json:"-" yaml:"-"`         // custom logger
 	LogLevel slog.Level    `json:"level" yaml:"level"` // if custom logger is nil, set the slog log level
-}
-
-type ExtensionSupport struct {
-	EnableTimeScaleDB bool `json:"enableTimeScaleDB" yaml:"enableTimescaleDB"`
 }
 
 type HeartbeatConfig struct {
@@ -59,7 +55,7 @@ type ListenerConfig struct {
 }
 
 // DSN returns a normal PostgreSQL connection string for regular database operations
-// (publication, metadata, snapshot chunks, etc.)
+// (publication, heartbeat, and source inspection).
 func (c *Config) DSN() string {
 	return c.buildDSN(false, false)
 }
@@ -123,40 +119,28 @@ func (c *Config) SetDefault() {
 		c.Logger.Logger = logger.NewSlog(c.Logger.LogLevel)
 	}
 
-	// Set default schema names for tables
+	// Own configured publication intent before applying defaults so the
+	// connector never aliases caller-owned table or column slices.
+	tables := make(publication.Tables, len(c.Publication.Tables))
+	for i, table := range c.Publication.Tables {
+		table.Columns = append([]string(nil), table.Columns...)
+		tables[i] = table
+	}
+	c.Publication.Tables = tables
+	c.Publication.Operations = append(publication.Operations(nil), c.Publication.Operations...)
+
 	for tableID, table := range c.Publication.Tables {
 		if table.Schema == "" {
 			c.Publication.Tables[tableID].Schema = defaultSchema
 		}
-	}
-
-	// Set default snapshot config
-	if c.Snapshot.Enabled {
-		if c.Snapshot.Mode == "" {
-			c.Snapshot.Mode = SnapshotModeNever
+		if len(table.Columns) > 0 {
+			c.Publication.Tables[tableID].ColumnsSpecified = true
 		}
-		if c.Snapshot.ChunkSize == 0 {
-			c.Snapshot.ChunkSize = 8_000
-		}
-		if c.Snapshot.ClaimTimeout == 0 {
-			c.Snapshot.ClaimTimeout = 30 * time.Second
-		}
-		if c.Snapshot.HeartbeatInterval == 0 {
-			c.Snapshot.HeartbeatInterval = 5 * time.Second
-		}
-
-		// Set default schema names for snapshot tables
-		for tableID, table := range c.Snapshot.Tables {
-			if table.Schema == "" {
-				c.Snapshot.Tables[tableID].Schema = defaultSchema
-			}
+		if table.Partitioned {
+			c.Publication.PublishViaPartitionRoot = true
 		}
 	}
-}
 
-// IsSnapshotOnlyMode returns true if snapshot is enabled and mode is snapshot_only
-func (c *Config) IsSnapshotOnlyMode() bool {
-	return c.Snapshot.Enabled && c.Snapshot.Mode == SnapshotModeSnapshotOnly
 }
 
 // IsHeartbeatEnabled returns true if heartbeat table is configured
@@ -164,69 +148,21 @@ func (c *Config) IsHeartbeatEnabled() bool {
 	return c.Heartbeat.Table.Name != ""
 }
 
-// GetSnapshotTables returns the tables to snapshot based on the configuration and publication info.
-// For snapshot_only mode: uses snapshot.tables (independent from publication)
-// For initial mode (snapshot + CDC):
-//   - If snapshot.tables specified: validates it's a subset of publication tables and returns snapshot.tables
-//   - If snapshot.tables not specified: returns all tables from publication
-func (c *Config) GetSnapshotTables(publicationInfo *publication.Config) (publication.Tables, error) {
-	// Mode 1: snapshot_only - independent from publication
-	if c.IsSnapshotOnlyMode() {
-		if len(c.Snapshot.Tables) == 0 {
-			return nil, errors.New("snapshot.tables must be specified for snapshot_only mode")
-		}
-		return c.Snapshot.Tables, nil
+// CapturePlan compiles the configured static source contract before any
+// publication mutation. The returned immutable plan is then the only value
+// used to create or validate the managed publication and to decode CDC.
+func (c *Config) CapturePlan(ctx context.Context, conn pq.Connection) (*capture.Plan, error) {
+	if c.Publication.AllTables || c.Publication.SchemaTables {
+		return nil, errors.New("dynamic FOR ALL TABLES and schema publications are not supported by a static capture plan")
 	}
-
-	// Mode 2: initial (snapshot + CDC)
-	// If snapshot.tables specified, validate it's a subset of publication tables
-	if len(c.Snapshot.Tables) > 0 {
-		return c.validateSnapshotSubset(publicationInfo.Tables)
+	if len(c.Publication.Tables) == 0 {
+		return nil, errors.New("publication has no explicit tables")
 	}
-
-	// Mode 3: initial with no snapshot.tables specified
-	// Use all tables from publication with merged user config (preserves SnapshotPartitionStrategy)
-	return c.mergePublicationTableConfig(publicationInfo.Tables), nil
-}
-
-// validateSnapshotSubset ensures snapshot.tables is a subset of publication tables
-// and returns the validated snapshot tables with publication metadata (like replica identity)
-// while preserving user's SnapshotPartitionStrategy from snapshot.tables config
-func (c *Config) validateSnapshotSubset(pubTables publication.Tables) (publication.Tables, error) {
-	if len(pubTables) == 0 {
-		return nil, errors.New("publication has no tables defined. Either specify tables in publication.tables or query an existing publication")
-	}
-
-	// Create map of publication tables for quick lookup
-	pubMap := make(map[string]publication.Table)
-	for _, t := range pubTables {
-		key := t.Schema + "." + t.Name
-		pubMap[key] = t
-	}
-
-	// Validate each snapshot table exists in publication
-	validatedTables := make(publication.Tables, 0, len(c.Snapshot.Tables))
-	for _, st := range c.Snapshot.Tables {
-		key := st.Schema + "." + st.Name
-		pubTable, exists := pubMap[key]
-		if !exists {
-			return nil, fmt.Errorf(
-				"snapshot table '%s' not found in publication '%s'. "+
-					"For snapshot+CDC mode, snapshot.tables must be a subset of publication tables",
-				key, c.Publication.Name,
-			)
-		}
-		mergedTable := pubTable
-		if st.SnapshotPartitionStrategy != "" {
-			mergedTable.SnapshotPartitionStrategy = st.SnapshotPartitionStrategy
-		}
-		if st.QueryCondition != "" {
-			mergedTable.QueryCondition = st.QueryCondition
-		}
-		validatedTables = append(validatedTables, mergedTable)
-	}
-
-	return validatedTables, nil
+	return capture.Compile(ctx, conn, capture.Spec{
+		Relations:               capture.RelationsFromConfig(c.Publication.Tables),
+		Operations:              append(publication.Operations(nil), c.Publication.Operations...),
+		PublishViaPartitionRoot: c.Publication.PublishViaPartitionRoot,
+	})
 }
 
 func (c *Config) ValidateHeartbeatInPublication(pubInfo *publication.Config) error {
@@ -271,20 +207,13 @@ func (c *Config) Validate() error {
 		err = errors.Join(err, errors.New("database cannot be empty"))
 	}
 
-	// Skip CDC-related validation for snapshot_only mode
-	if !c.IsSnapshotOnlyMode() {
-		if cErr := c.Publication.Validate(); cErr != nil {
-			err = errors.Join(err, cErr)
-		}
-
-		slotConfig := c.Slot
-		slotConfig.SlotActivityCheckerInterval = normalizeMillisecondsDuration(slotConfig.SlotActivityCheckerInterval, 0)
-		if cErr := slotConfig.Validate(); cErr != nil {
-			err = errors.Join(err, cErr)
-		}
+	if cErr := c.Publication.Validate(); cErr != nil {
+		err = errors.Join(err, cErr)
 	}
 
-	if cErr := c.Snapshot.Validate(); cErr != nil {
+	slotConfig := c.Slot
+	slotConfig.SlotActivityCheckerInterval = normalizeMillisecondsDuration(slotConfig.SlotActivityCheckerInterval, 0)
+	if cErr := slotConfig.Validate(); cErr != nil {
 		err = errors.Join(err, cErr)
 	}
 
@@ -292,7 +221,10 @@ func (c *Config) Validate() error {
 		if c.Heartbeat.Interval <= 0 {
 			err = errors.Join(err, errors.New("heartbeat.interval must be greater than 0 when heartbeat table is configured"))
 		}
-		if !c.IsSnapshotOnlyMode() && !c.Publication.AllTables && len(c.Publication.Tables) > 0 {
+		if !c.Publication.Operations.Contains(publication.OperationUpdate) {
+			err = errors.Join(err, errors.New("publication.operations must include UPDATE when heartbeat is configured"))
+		}
+		if !c.Publication.AllTables && len(c.Publication.Tables) > 0 {
 			if hErr := c.ValidateHeartbeatInPublication(&publication.Config{
 				Name:   c.Publication.Name,
 				Tables: c.Publication.Tables,
@@ -331,104 +263,3 @@ func normalizeMillisecondsDuration(value, defaultValue time.Duration) time.Durat
 func isEmpty(s string) bool {
 	return strings.TrimSpace(s) == ""
 }
-
-func (c *Config) mergePublicationTableConfig(pubInfoTables publication.Tables) publication.Tables {
-	if len(c.Publication.Tables) == 0 {
-		return pubInfoTables
-	}
-
-	userConfigMap := make(map[string]publication.Table)
-	for _, t := range c.Publication.Tables {
-		key := t.Schema + "." + t.Name
-		userConfigMap[key] = t
-	}
-
-	result := make(publication.Tables, len(pubInfoTables))
-	for i, t := range pubInfoTables {
-		result[i] = t
-		key := t.Schema + "." + t.Name
-		if userTable, exists := userConfigMap[key]; exists {
-			if userTable.SnapshotPartitionStrategy != "" {
-				result[i].SnapshotPartitionStrategy = userTable.SnapshotPartitionStrategy
-			}
-			if userTable.QueryCondition != "" {
-				result[i].QueryCondition = userTable.QueryCondition
-			}
-		}
-	}
-	return result
-}
-
-type SnapshotConfig struct {
-	Mode              SnapshotMode       `json:"mode" yaml:"mode"`
-	InstanceID        string             `json:"instanceId" yaml:"instanceId"`
-	ID                string             `json:"id" yaml:"id"`
-	QueryCondition    string             `json:"queryCondition,omitempty" yaml:"queryCondition,omitempty"`
-	Tables            publication.Tables `json:"tables" yaml:"tables"`
-	ChunkSize         int64              `json:"chunkSize" yaml:"chunkSize"`
-	ClaimTimeout      time.Duration      `json:"claimTimeout" yaml:"claimTimeout"`
-	HeartbeatInterval time.Duration      `json:"heartbeatInterval" yaml:"heartbeatInterval"`
-	Enabled           bool               `json:"enabled" yaml:"enabled"`
-	Resnapshot        bool               `json:"resnapshot" yaml:"resnapshot"`
-	ResnapshotID      string             `json:"resnapshotId,omitempty" yaml:"resnapshotId,omitempty"`
-}
-
-func (s *SnapshotConfig) Validate() error {
-	if !s.Enabled {
-		return nil
-	}
-
-	switch s.Mode {
-	case SnapshotModeInitial, SnapshotModeNever, SnapshotModeSnapshotOnly:
-	default:
-		return errors.New("snapshot mode must be 'initial', 'never', or 'snapshot_only'")
-	}
-
-	// Validate chunk-based config
-	if s.ChunkSize <= 0 {
-		return errors.New("snapshot chunk size must be greater than 0")
-	}
-	if s.ClaimTimeout <= 0 {
-		return errors.New("snapshot claim timeout must be greater than 0")
-	}
-	if s.HeartbeatInterval <= 0 {
-		return errors.New("snapshot heartbeat interval must be greater than 0")
-	}
-	if s.HeartbeatInterval > s.ClaimTimeout/2 {
-		return errors.New("snapshot heartbeat interval must not exceed half the claim timeout")
-	}
-	if s.Resnapshot && strings.TrimSpace(s.ResnapshotID) == "" {
-		return errors.New("snapshot.resnapshotId is required when resnapshot is enabled")
-	}
-
-	// For snapshot_only mode, tables must be specified
-	if s.Mode == SnapshotModeSnapshotOnly && len(s.Tables) == 0 {
-		return errors.New("snapshot.tables must be specified for snapshot_only mode")
-	}
-
-	if s.QueryCondition != "" {
-		if err := publication.ValidateQueryCondition(s.QueryCondition); err != nil {
-			return err
-		}
-	}
-	for _, table := range s.Tables {
-		if !slices.Contains(publication.ValidSnapshotPartitionStrategies, table.SnapshotPartitionStrategy) {
-			return fmt.Errorf("snapshot.tables %s.%s: undefined snapshot partition strategy %q", table.Schema, table.Name, table.SnapshotPartitionStrategy)
-		}
-		if table.QueryCondition != "" {
-			if err := publication.ValidateQueryCondition(table.QueryCondition); err != nil {
-				return fmt.Errorf("snapshot.tables %s.%s: %w", table.Schema, table.Name, err)
-			}
-		}
-	}
-
-	return nil
-}
-
-type SnapshotMode string
-
-const (
-	SnapshotModeInitial      SnapshotMode = "initial"
-	SnapshotModeNever        SnapshotMode = "never"
-	SnapshotModeSnapshotOnly SnapshotMode = "snapshot_only"
-)

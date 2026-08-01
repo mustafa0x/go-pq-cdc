@@ -10,9 +10,9 @@ import (
 )
 
 const (
-	UpdateTupleTypeKey = 'K'
-	UpdateTupleTypeOld = 'O'
-	UpdateTupleTypeNew = 'N'
+	TupleTypeKey = 'K'
+	TupleTypeOld = 'O'
+	TupleTypeNew = 'N'
 )
 
 type Update struct {
@@ -48,13 +48,13 @@ func NewUpdate(data []byte, streamedTransaction bool, relation map[uint32]*Relat
 	var err error
 
 	if msg.OldTupleData != nil {
-		msg.OldDecoded, err = msg.OldTupleData.DecodeWithColumn(rel.Columns)
+		msg.OldDecoded, err = msg.OldTupleData.DecodeWithColumn(rel.Columns, msg.OldTupleType)
 		if err != nil {
 			return nil, err
 		}
 	}
 
-	msg.NewDecoded, err = msg.NewTupleData.DecodeWithColumn(rel.Columns)
+	msg.NewDecoded, err = msg.NewTupleData.DecodeWithColumn(rel.Columns, TupleTypeNew)
 	if err != nil {
 		return nil, err
 	}
@@ -85,20 +85,20 @@ func (m *Update) decode(data []byte, streamedTransaction bool) error {
 	var err error
 
 	switch m.OldTupleType {
-	case UpdateTupleTypeKey, UpdateTupleTypeOld:
+	case TupleTypeKey, TupleTypeOld:
 		m.OldTupleData, err = tuple.NewData(data, m.OldTupleType, skipByte)
 		if err != nil {
 			return errors.Wrap(err, "update message old tuple data")
 		}
 		skipByte = m.OldTupleData.SkipByte
 		fallthrough
-	case UpdateTupleTypeNew:
-		m.NewTupleData, err = tuple.NewData(data, UpdateTupleTypeNew, skipByte)
+	case TupleTypeNew:
+		m.NewTupleData, err = tuple.NewData(data, TupleTypeNew, skipByte)
 		if err != nil {
 			return errors.Wrap(err, "update message new tuple data")
 		}
 
-		if m.OldTupleData != nil {
+		if m.OldTupleType == TupleTypeOld {
 			for i, col := range m.NewTupleData.Columns {
 				// because toasted columns not sent until the toasted column updated
 				if col.DataType == tuple.DataTypeToast {

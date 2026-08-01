@@ -1,7 +1,10 @@
 package config
 
 import (
+	"bytes"
 	"encoding/json"
+	"fmt"
+	"io"
 	"os"
 
 	"github.com/go-playground/errors"
@@ -9,33 +12,35 @@ import (
 )
 
 func ReadConfigYAML(path string) (Config, error) {
-	b, err := os.ReadFile(path)
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return Config{}, errors.Wrap(err, "read yaml config")
 	}
 
-	c := Config{}
-
-	err = yaml.Unmarshal(b, &c)
-	if err != nil {
+	var cfg Config
+	if err := yaml.UnmarshalStrict(data, &cfg); err != nil {
 		return Config{}, errors.Wrap(err, "yaml config file parse")
 	}
-
-	return c, nil
+	return cfg, nil
 }
 
 func ReadConfigJSON(path string) (Config, error) {
-	b, err := os.ReadFile(path)
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return Config{}, errors.Wrap(err, "read json config")
 	}
 
-	c := Config{}
-
-	err = json.Unmarshal(b, &c)
-	if err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	var cfg Config
+	if err := decoder.Decode(&cfg); err != nil {
 		return Config{}, errors.Wrap(err, "json config file parse")
 	}
-
-	return c, nil
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		if err == nil {
+			return Config{}, fmt.Errorf("json config file parse: multiple JSON values")
+		}
+		return Config{}, errors.Wrap(err, "json config file parse")
+	}
+	return cfg, nil
 }

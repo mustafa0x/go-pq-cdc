@@ -39,7 +39,7 @@ func NewDelete(data []byte, streamedTransaction bool, relation map[uint32]*Relat
 
 	var err error
 
-	msg.OldDecoded, err = msg.OldTupleData.DecodeWithColumn(rel.Columns)
+	msg.OldDecoded, err = msg.OldTupleData.DecodeWithColumn(rel.Columns, msg.OldTupleType)
 	if err != nil {
 		return nil, err
 	}

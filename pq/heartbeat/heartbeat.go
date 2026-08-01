@@ -35,60 +35,29 @@ func New(dsn string, cfg config.HeartbeatConfig) *Heartbeat {
 	}
 }
 
-// EnsureTable checks if the heartbeat table exists and creates it only when missing.
-// This avoids permission errors for users who only have replication privileges.
-func (h *Heartbeat) EnsureTable(ctx context.Context, conn pq.Connection) error {
-	schema := quoteIdentifier(h.cfg.Table.Schema)
-	table := quoteIdentifier(h.cfg.Table.Name)
-
+// ValidateTable verifies the pre-provisioned heartbeat relation without
+// mutating the source database. Startup must finish publication and capture
+// validation before the heartbeat loop is allowed to write.
+func (h *Heartbeat) ValidateTable(ctx context.Context, conn pq.Connection) error {
 	exists, err := pq.TableExists(ctx, conn, h.cfg.Table.Schema, h.cfg.Table.Name)
 	if err != nil {
 		return fmt.Errorf("check heartbeat table existence: %w", err)
 	}
-
 	if !exists {
-		if err := h.createTable(ctx, conn); err != nil {
-			return err
-		}
-		logger.Info("heartbeat table created", "table", schema+"."+table)
+		return fmt.Errorf(
+			"heartbeat table %s.%s does not exist; create it before starting the connector",
+			h.cfg.Table.Schema,
+			h.cfg.Table.Name,
+		)
 	}
 
-	if err := h.insertInitialRow(ctx, conn); err != nil {
-		return err
-	}
-
-	logger.Info("heartbeat table ready to use", "table", schema+"."+table)
-	return nil
-}
-
-func (h *Heartbeat) createTable(ctx context.Context, conn pq.Connection) error {
 	schema := quoteIdentifier(h.cfg.Table.Schema)
 	table := quoteIdentifier(h.cfg.Table.Name)
-	constraint := quoteIdentifier(h.cfg.Table.Name + "_single_row")
-
-	sql := fmt.Sprintf(`
-		CREATE TABLE %s.%s (
-			id INTEGER PRIMARY KEY DEFAULT 1,
-			last_heartbeat TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-			CONSTRAINT %s CHECK (id = 1)
-		)`, schema, table, constraint)
-
-	if err := pq.ExecSQL(ctx, conn, sql); err != nil {
-		return fmt.Errorf("create heartbeat table failed: %w", err)
+	if err := pq.ExecSQL(ctx, conn, "EXPLAIN "+h.query()); err != nil {
+		return fmt.Errorf("validate heartbeat table contract: %w", err)
 	}
-	return nil
-}
 
-func (h *Heartbeat) insertInitialRow(ctx context.Context, conn pq.Connection) error {
-	schema := quoteIdentifier(h.cfg.Table.Schema)
-	table := quoteIdentifier(h.cfg.Table.Name)
-
-	sql := fmt.Sprintf(`
-		INSERT INTO %s.%s (id) VALUES (1) ON CONFLICT DO NOTHING`, schema, table)
-
-	if err := pq.ExecSQL(ctx, conn, sql); err != nil {
-		return fmt.Errorf("insert heartbeat row failed: %w", err)
-	}
+	logger.Info("heartbeat table validated", "table", schema+"."+table)
 	return nil
 }
 
@@ -139,25 +108,18 @@ func (h *Heartbeat) execute(ctx context.Context) error {
 	if resultReader == nil {
 		return fmt.Errorf("heartbeat exec returned nil resultReader")
 	}
-	defer func() {
-		if err := resultReader.Close(); err != nil {
-			logger.Error("heartbeat result reader close failed", "error", err)
-		}
-	}()
 
-	rows, err := resultReader.ReadAll()
-	if err != nil {
+	_, readErr := resultReader.ReadAll()
+	closeErr := resultReader.Close()
+	if readErr != nil || closeErr != nil {
 		// On error, proactively close and nil the connection so that the next
 		// heartbeat tick will try to re-establish it.
 		_ = h.conn.Close(ctx)
 		h.conn = nil
-		return fmt.Errorf("heartbeat query failed: %w", err)
-	}
-
-	if len(rows) == 0 {
-		if err := h.insertInitialRow(ctx, h.conn); err != nil {
-			return fmt.Errorf("recreate heartbeat row failed: %w", err)
+		if readErr != nil {
+			return fmt.Errorf("heartbeat query failed: %w", readErr)
 		}
+		return fmt.Errorf("close heartbeat result reader: %w", closeErr)
 	}
 
 	return nil
@@ -167,7 +129,8 @@ func (h *Heartbeat) execute(ctx context.Context) error {
 func (h *Heartbeat) query() string {
 	schema := quoteIdentifier(h.cfg.Table.Schema)
 	table := quoteIdentifier(h.cfg.Table.Name)
-	return fmt.Sprintf(`UPDATE %s.%s SET last_heartbeat = NOW() WHERE id = 1 RETURNING 1`, schema, table)
+	return fmt.Sprintf(`INSERT INTO %s.%s (id, last_heartbeat) VALUES (1, NOW())
+		ON CONFLICT (id) DO UPDATE SET last_heartbeat = EXCLUDED.last_heartbeat`, schema, table)
 }
 
 // Close closes the heartbeat connection

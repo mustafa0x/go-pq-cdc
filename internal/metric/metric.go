@@ -24,17 +24,6 @@ type Metric interface {
 	SetSlotRetainedWALSize(lsn float64)
 	SetSlotLag(lsn float64)
 
-	SetSnapshotInProgress(inProgress bool)
-	SetSnapshotTotalTables(total int)
-	SetSnapshotCompletedTables(completed int)
-	SnapshotRowsIncrement(count int64)
-	SetSnapshotDurationSeconds(seconds float64)
-
-	// Distributed snapshot metrics
-	SetSnapshotTotalChunks(total int)
-	SetSnapshotCompletedChunks(completed int)
-	SetSnapshotActiveWorkers(workers int)
-
 	PrometheusCollectors() []prometheus.Collector
 }
 
@@ -52,18 +41,6 @@ type metric struct {
 	slotCurrentLSN             prometheus.Gauge
 	slotRetainedWALSize        prometheus.Gauge
 	slotLag                    prometheus.Gauge
-
-	// Snapshot metrics
-	snapshotInProgress      prometheus.Gauge
-	snapshotTotalTables     prometheus.Gauge
-	snapshotCompletedTables prometheus.Gauge
-	snapshotTotalRows       prometheus.Counter
-	snapshotDurationSeconds prometheus.Gauge
-
-	// Distributed snapshot metrics
-	snapshotTotalChunks     prometheus.Gauge
-	snapshotCompletedChunks prometheus.Gauge
-	snapshotActiveWorkers   prometheus.Gauge
 }
 
 //nolint:funlen
@@ -190,86 +167,6 @@ func NewMetric(slotName string) Metric {
 				"host":      hostname,
 			},
 		}),
-		snapshotInProgress: prometheus.NewGauge(prometheus.GaugeOpts{
-			Namespace: cdcNamespace,
-			Subsystem: "snapshot",
-			Name:      "in_progress",
-			Help:      "indicates if snapshot is currently in progress (1) or not (0)",
-			ConstLabels: prometheus.Labels{
-				"slot_name": slotName,
-				"host":      hostname,
-			},
-		}),
-		snapshotTotalTables: prometheus.NewGauge(prometheus.GaugeOpts{
-			Namespace: cdcNamespace,
-			Subsystem: "snapshot",
-			Name:      "total_tables",
-			Help:      "total number of tables to snapshot",
-			ConstLabels: prometheus.Labels{
-				"slot_name": slotName,
-				"host":      hostname,
-			},
-		}),
-		snapshotCompletedTables: prometheus.NewGauge(prometheus.GaugeOpts{
-			Namespace: cdcNamespace,
-			Subsystem: "snapshot",
-			Name:      "completed_tables",
-			Help:      "number of tables completed in snapshot",
-			ConstLabels: prometheus.Labels{
-				"slot_name": slotName,
-				"host":      hostname,
-			},
-		}),
-		snapshotTotalRows: prometheus.NewCounter(prometheus.CounterOpts{
-			Namespace: cdcNamespace,
-			Subsystem: "snapshot",
-			Name:      "total_rows",
-			Help:      "total number of rows read during snapshot",
-			ConstLabels: prometheus.Labels{
-				"slot_name": slotName,
-				"host":      hostname,
-			},
-		}),
-		snapshotDurationSeconds: prometheus.NewGauge(prometheus.GaugeOpts{
-			Namespace: cdcNamespace,
-			Subsystem: "snapshot",
-			Name:      "duration_seconds",
-			Help:      "duration of the last snapshot operation in seconds",
-			ConstLabels: prometheus.Labels{
-				"slot_name": slotName,
-				"host":      hostname,
-			},
-		}),
-		snapshotTotalChunks: prometheus.NewGauge(prometheus.GaugeOpts{
-			Namespace: cdcNamespace,
-			Subsystem: "snapshot",
-			Name:      "total_chunks",
-			Help:      "total number of chunks in distributed snapshot",
-			ConstLabels: prometheus.Labels{
-				"slot_name": slotName,
-				"host":      hostname,
-			},
-		}),
-		snapshotCompletedChunks: prometheus.NewGauge(prometheus.GaugeOpts{
-			Namespace: cdcNamespace,
-			Subsystem: "snapshot",
-			Name:      "completed_chunks",
-			Help:      "number of chunks completed in distributed snapshot",
-			ConstLabels: prometheus.Labels{
-				"slot_name": slotName,
-				"host":      hostname,
-			},
-		}),
-		snapshotActiveWorkers: prometheus.NewGauge(prometheus.GaugeOpts{
-			Namespace: cdcNamespace,
-			Subsystem: "snapshot",
-			Name:      "active_workers",
-			Help:      "number of active worker instances processing distributed snapshot",
-			ConstLabels: prometheus.Labels{
-				"slot_name": slotName,
-				"host":      hostname,
-			},
-		}),
 	}
 }
 
@@ -287,14 +184,6 @@ func (m *metric) PrometheusCollectors() []prometheus.Collector {
 		m.slotConfirmedFlushLSN,
 		m.slotRetainedWALSize,
 		m.slotLag,
-		m.snapshotInProgress,
-		m.snapshotTotalTables,
-		m.snapshotCompletedTables,
-		m.snapshotTotalRows,
-		m.snapshotDurationSeconds,
-		m.snapshotTotalChunks,
-		m.snapshotCompletedChunks,
-		m.snapshotActiveWorkers,
 	}
 }
 
@@ -343,40 +232,4 @@ func (m *metric) SetSlotRetainedWALSize(lsn float64) {
 
 func (m *metric) SetSlotLag(lsn float64) {
 	m.slotLag.Set(float64(lsn))
-}
-
-func (m *metric) SetSnapshotInProgress(inProgress bool) {
-	value := 0.0
-	if inProgress {
-		value = 1.0
-	}
-	m.snapshotInProgress.Set(value)
-}
-
-func (m *metric) SetSnapshotTotalTables(total int) {
-	m.snapshotTotalTables.Set(float64(total))
-}
-
-func (m *metric) SetSnapshotCompletedTables(completed int) {
-	m.snapshotCompletedTables.Set(float64(completed))
-}
-
-func (m *metric) SnapshotRowsIncrement(count int64) {
-	m.snapshotTotalRows.Add(float64(count))
-}
-
-func (m *metric) SetSnapshotDurationSeconds(seconds float64) {
-	m.snapshotDurationSeconds.Set(seconds)
-}
-
-func (m *metric) SetSnapshotTotalChunks(total int) {
-	m.snapshotTotalChunks.Set(float64(total))
-}
-
-func (m *metric) SetSnapshotCompletedChunks(completed int) {
-	m.snapshotCompletedChunks.Set(float64(completed))
-}
-
-func (m *metric) SetSnapshotActiveWorkers(workers int) {
-	m.snapshotActiveWorkers.Set(float64(workers))
 }

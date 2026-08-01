@@ -14,6 +14,7 @@ type Config struct {
 	//   1 – no streaming transaction support.
 	//   2 – supports streaming large in-progress transactions (default).
 	ProtoVersion      int  `json:"protoVersion" yaml:"protoVersion"`
+	Messages          bool `json:"messages" yaml:"messages"`
 	CreateIfNotExists bool `json:"createIfNotExists" yaml:"createIfNotExists"`
 }
 

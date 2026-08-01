@@ -30,7 +30,7 @@ Replication startup now uses `slot.protoVersion`:
 
 - Always sends `proto_version '<N>'`
 - Sends `streaming 'true'` only when `protoVersion >= 2`
-- Does not request logical `messages`, which are not part of the listener contract
+- Requests logical `messages` only when `slot.messages` is enabled
 
 Both protocol modes target the repository's PostgreSQL 16+ support floor.
 

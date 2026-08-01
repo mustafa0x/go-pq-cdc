@@ -17,19 +17,19 @@ import (
 )
 
 func TestStreamCloseBeforeOpenDoesNotBlock(t *testing.T) {
-	stream := NewStream("", config.Config{}, metric.NewMetric("test_slot"), func(*ListenerContext) {})
+	stream := NewStream("", config.Config{}, nil, metric.NewMetric("test_slot"), func(*ListenerContext) {})
 
 	requireCloseReturns(t, stream, "Close blocked before Open started the sink")
 }
 
 func TestStreamCloseIsIdempotentBeforeOpen(t *testing.T) {
-	stream := NewStream("", config.Config{}, metric.NewMetric("test_slot"), func(*ListenerContext) {})
+	stream := NewStream("", config.Config{}, nil, metric.NewMetric("test_slot"), func(*ListenerContext) {})
 	requireCloseReturns(t, stream, "first Close blocked")
 	requireCloseReturns(t, stream, "second Close blocked")
 }
 
 func TestStreamCloseAfterOpenFailureDoesNotBlock(t *testing.T) {
-	stream := NewStream("", config.Config{}, metric.NewMetric("test_slot"), func(*ListenerContext) {})
+	stream := NewStream("", config.Config{}, nil, metric.NewMetric("test_slot"), func(*ListenerContext) {})
 
 	if err := stream.Open(context.Background()); err == nil {
 		t.Fatal("expected Open to fail without a connected postgres connection")
@@ -41,7 +41,7 @@ func TestStreamCloseAfterOpenFailureDoesNotBlock(t *testing.T) {
 func TestStreamSinkExitStopsProcessor(t *testing.T) {
 	logger.InitLogger(logger.NewSlog(slog.LevelError))
 
-	stream := NewStream("", config.Config{}, metric.NewMetric("test_slot"), func(*ListenerContext) {}).(*stream)
+	stream := NewStream("", config.Config{}, nil, metric.NewMetric("test_slot"), func(*ListenerContext) {}).(*stream)
 	stream.conn = receiveErrorConn{}
 	// Simulate Close marking the stream closed before ReceiveMessage unblocks.
 	stream.closed.Store(true)
@@ -76,7 +76,7 @@ func TestStreamCloseFlushesFinalConfirmedLSN(t *testing.T) {
 		fe: pgproto3.NewFrontend(strings.NewReader(""), &written),
 	}
 
-	stream := NewStream("", config.Config{}, metric.NewMetric("test_slot"), func(*ListenerContext) {}).(*stream)
+	stream := NewStream("", config.Config{}, nil, metric.NewMetric("test_slot"), func(*ListenerContext) {}).(*stream)
 	stream.conn = conn
 	stream.UpdateXLogPos(200)
 	stream.UpdateConfirmedXLogPos(150)
@@ -104,7 +104,7 @@ func TestStreamCloseWaitsForInFlightAckBeforeFinalFlush(t *testing.T) {
 	listenerEntered := make(chan struct{})
 	allowAck := make(chan struct{})
 	ackResult := make(chan error, 1)
-	stream := NewStream("", config.Config{}, metric.NewMetric("test_slot"), func(ctx *ListenerContext) {
+	stream := NewStream("", config.Config{}, nil, metric.NewMetric("test_slot"), func(ctx *ListenerContext) {
 		close(listenerEntered)
 		<-allowAck
 		ackResult <- ctx.Ack()
@@ -143,7 +143,7 @@ func TestStreamCloseWaitsForInFlightAckBeforeFinalFlush(t *testing.T) {
 }
 
 func TestAckAfterStreamCloseFails(t *testing.T) {
-	stream := NewStream("", config.Config{}, metric.NewMetric("test_slot"), func(*ListenerContext) {}).(*stream)
+	stream := NewStream("", config.Config{}, nil, metric.NewMetric("test_slot"), func(*ListenerContext) {}).(*stream)
 	ack := stream.ackFuncForMessage(&Message{ackLSN: 150}, &transactionAckTracker{})
 	stream.closed.Store(true)
 

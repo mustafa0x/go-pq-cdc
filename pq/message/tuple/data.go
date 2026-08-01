@@ -101,13 +101,16 @@ func (d *Data) Decode(data []byte, skipByteLength int) error {
 	return nil
 }
 
-func (d *Data) DecodeWithColumn(columns []RelationColumn) (map[string]any, error) {
+func (d *Data) DecodeWithColumn(columns []RelationColumn, tupleType uint8) (map[string]any, error) {
 	if len(d.Columns) > len(columns) {
 		return nil, errors.Newf("tuple column count %d exceeds relation column count %d", len(d.Columns), len(columns))
 	}
 
 	decoded := make(map[string]any, d.ColumnNumber)
 	for idx, col := range d.Columns {
+		if tupleType == 'K' && columns[idx].Flags&1 == 0 {
+			continue
+		}
 		colName := columns[idx].Name
 		switch col.DataType {
 		case DataTypeNull:

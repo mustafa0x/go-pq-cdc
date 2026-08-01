@@ -20,11 +20,14 @@ func New(conn pq.Connection) *Replication {
 	return &Replication{conn: conn}
 }
 
-func (r *Replication) Start(publicationName, slotName string, startLSN pq.LSN, protoVersion int) error {
+func (r *Replication) Start(publicationName, slotName string, startLSN pq.LSN, protoVersion int, messages bool) error {
 	pluginArguments := []string{"proto_version " + pq.QuoteLiteral(strconv.Itoa(protoVersion))}
 
 	if protoVersion >= 2 {
 		pluginArguments = append(pluginArguments, "streaming 'true'")
+	}
+	if messages {
+		pluginArguments = append(pluginArguments, "messages 'true'")
 	}
 
 	pluginArguments = append(pluginArguments, "publication_names "+pq.QuoteLiteral(publicationName))

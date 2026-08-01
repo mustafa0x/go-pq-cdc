@@ -35,6 +35,9 @@ func TestHeartbeatAdvancesLSN(t *testing.T) {
 		if !assert.NoError(t, SetupTestDB(ctx, postgresConn, cdcCfg)) {
 			t.FailNow()
 		}
+		if !assert.NoError(t, createHeartbeatTable(ctx, postgresConn)) {
+			t.FailNow()
+		}
 
 		// Extend publication with heartbeat table so that heartbeat changes are part of CDC stream
 		cdcCfg.Publication.Tables = append(cdcCfg.Publication.Tables,
@@ -45,7 +48,7 @@ func TestHeartbeatAdvancesLSN(t *testing.T) {
 			},
 		)
 
-		// Enable heartbeat by specifying the table (library auto-creates it)
+		// Enable heartbeat against the pre-provisioned table
 		cdcCfg.Heartbeat = config.HeartbeatConfig{
 			Table: publication.Table{
 				Name:   "heartbeat_events",
@@ -110,7 +113,6 @@ func TestHeartbeatAdvancesLSN(t *testing.T) {
 	})
 }
 
-
 func TestHeartbeatMissingFromPublicationFails(t *testing.T) {
 	t.Helper()
 
@@ -128,6 +130,9 @@ func TestHeartbeatMissingFromPublicationFails(t *testing.T) {
 		}
 
 		if !assert.NoError(t, SetupTestDB(ctx, postgresConn, cdcCfg)) {
+			t.FailNow()
+		}
+		if !assert.NoError(t, createHeartbeatTable(ctx, postgresConn)) {
 			t.FailNow()
 		}
 
@@ -151,6 +156,53 @@ func TestHeartbeatMissingFromPublicationFails(t *testing.T) {
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "heartbeat table public.heartbeat_events is not included in publication")
 	})
+}
+
+func TestHeartbeatRequiresPreprovisionedTable(t *testing.T) {
+	ctx := context.Background()
+	cdcCfg := Config
+	cdcCfg.Slot.Name = "slot_test_heartbeat_preprovisioned"
+	cdcCfg.Publication.Tables = append(publication.Tables(nil), Config.Publication.Tables...)
+	cdcCfg.Publication.Tables = append(cdcCfg.Publication.Tables, publication.Table{
+		Name:            "heartbeat_events",
+		Schema:          "public",
+		ReplicaIdentity: publication.ReplicaIdentityDefault,
+	})
+	cdcCfg.Heartbeat = config.HeartbeatConfig{
+		Table:    publication.Table{Name: "heartbeat_events", Schema: "public"},
+		Interval: time.Second,
+	}
+
+	postgresConn, err := newPostgresConn()
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		assert.NoError(t, RestoreDB(ctx))
+		assert.NoError(t, postgresConn.Close(ctx))
+	})
+
+	require.NoError(t, SetupTestDB(ctx, postgresConn, cdcCfg))
+	require.NoError(t, pgExec(ctx, postgresConn, "DROP TABLE IF EXISTS public.heartbeat_events"))
+
+	_, err = cdc.NewConnector(ctx, cdcCfg, func(ctx *replication.ListenerContext) {
+		_ = ctx.Ack()
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "heartbeat table public.heartbeat_events does not exist")
+
+	exists, checkErr := pq.TableExists(ctx, postgresConn, "public", "heartbeat_events")
+	require.NoError(t, checkErr)
+	assert.False(t, exists)
+}
+
+func createHeartbeatTable(ctx context.Context, conn pq.Connection) error {
+	return pgExec(ctx, conn, `
+		DROP TABLE IF EXISTS public.heartbeat_events;
+		CREATE TABLE public.heartbeat_events (
+			id integer PRIMARY KEY DEFAULT 1,
+			last_heartbeat timestamptz NOT NULL DEFAULT now(),
+			CONSTRAINT heartbeat_events_single_row CHECK (id = 1)
+		);
+	`)
 }
 
 // readSlotLSNs fetches restart_lsn and confirmed_flush_lsn for a given slot

@@ -33,10 +33,15 @@ func (ops Operations) Validate() error {
 		return errors.New("at least one operation must be defined")
 	}
 
+	seen := make(map[Operation]struct{}, len(ops))
 	for _, op := range ops {
 		if err := op.Validate(); err != nil {
 			return err
 		}
+		if _, ok := seen[op]; ok {
+			return errors.Newf("duplicate publication operation %s", op)
+		}
+		seen[op] = struct{}{}
 	}
 
 	return nil
@@ -46,7 +51,7 @@ func (ops Operations) String() string {
 	res := make([]string, len(ops))
 
 	for i, op := range ops {
-		res[i] = string(op)
+		res[i] = strings.ToLower(string(op))
 	}
 
 	return strings.Join(res, ", ")

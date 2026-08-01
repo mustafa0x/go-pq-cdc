@@ -119,3 +119,31 @@ func TestUpdateBoundsChecks(t *testing.T) {
 		assert.Contains(t, err.Error(), "exceeds old tuple column count")
 	})
 }
+
+func TestUpdateKeyTupleDoesNotReplaceUnchangedToast(t *testing.T) {
+	data := []byte{'U'}
+	data = appendUint32ForTest(data, 42)
+	data = append(data,
+		'K', 0, 2,
+		tuple.DataTypeText, 0, 0, 0, 1, '1',
+		tuple.DataTypeNull,
+		'N', 0, 2,
+		tuple.DataTypeText, 0, 0, 0, 1, '2',
+		tuple.DataTypeToast,
+	)
+	relations := map[uint32]*Relation{42: {
+		OID:       42,
+		Namespace: "public",
+		Name:      "items",
+		Columns: []tuple.RelationColumn{
+			{Name: "id", DataType: 23, Flags: 1},
+			{Name: "body", DataType: 25},
+		},
+	}}
+
+	msg, err := NewUpdate(data, false, relations, time.Now())
+	require.NoError(t, err)
+	assert.Equal(t, map[string]any{"id": int32(1)}, msg.OldDecoded)
+	assert.Equal(t, map[string]any{"id": int32(2)}, msg.NewDecoded)
+	assert.Equal(t, tuple.DataTypeToast, msg.NewTupleData.Columns[1].DataType)
+}

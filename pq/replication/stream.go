@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"maps"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -13,6 +14,7 @@ import (
 	"github.com/Trendyol/go-pq-cdc/internal/metric"
 	"github.com/Trendyol/go-pq-cdc/logger"
 	"github.com/Trendyol/go-pq-cdc/pq"
+	"github.com/Trendyol/go-pq-cdc/pq/capture"
 	"github.com/Trendyol/go-pq-cdc/pq/message"
 	"github.com/Trendyol/go-pq-cdc/pq/message/format"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -47,6 +49,8 @@ type Message struct {
 	message  any
 	walStart pq.LSN
 	ackLSN   pq.LSN
+	xid      uint32
+	autoAck  bool
 }
 
 type Streamer interface {
@@ -55,41 +59,60 @@ type Streamer interface {
 	Close(ctx context.Context)
 	GetSystemInfo() *pq.IdentifySystemResult
 	GetMetric() metric.Metric
-	OpenFromSnapshotLSN()
+}
+
+// SessionStreamer exposes an exact start position and listener quiescence for
+// callers that own the replication session from bootstrap through shutdown.
+type SessionStreamer interface {
+	Streamer
+	OpenAt(ctx context.Context, lsn pq.LSN) error
+	Wait(ctx context.Context) error
+	Done() <-chan struct{}
+	Err() error
 }
 
 type stream struct {
-	conn                pq.Connection
-	metric              metric.Metric
-	system              *pq.IdentifySystemResult
-	relation            map[uint32]*format.Relation
-	messageCH           chan *Message
-	listenerFunc        ListenerFunc
-	sinkEnd             chan struct{}
-	processEnd          chan struct{}
-	feedbackCh          chan struct{}
-	doneCtx             context.Context
-	finish              context.CancelCauseFunc
-	mu                  sync.RWMutex
-	ackMu               sync.Mutex
-	config              config.Config
-	lastXLogPos         pq.LSN
-	confirmedXLogPos    pq.LSN
-	openFromSnapshotLSN bool
-	snapshotLSN         pq.LSN
-	closed              atomic.Bool
-	sinkStarted         atomic.Bool
-	processStarted      atomic.Bool
-	closeOnce           sync.Once
+	conn             pq.Connection
+	metric           metric.Metric
+	system           *pq.IdentifySystemResult
+	relation         map[uint32]*format.Relation
+	capturePlan      *capture.Plan
+	messageCH        chan *Message
+	listenerFunc     ListenerFunc
+	sinkEnd          chan struct{}
+	processEnd       chan struct{}
+	feedbackCh       chan struct{}
+	doneCtx          context.Context
+	finish           context.CancelCauseFunc
+	mu               sync.RWMutex
+	ackMu            sync.Mutex
+	config           config.Config
+	lastXLogPos      pq.LSN
+	confirmedXLogPos pq.LSN
+	closed           atomic.Bool
+	sinkStarted      atomic.Bool
+	processStarted   atomic.Bool
+	closeOnce        sync.Once
 }
 
-func NewStream(dsn string, cfg config.Config, m metric.Metric, listenerFunc ListenerFunc) Streamer {
+func NewStream(dsn string, cfg config.Config, plan *capture.Plan, m metric.Metric, listenerFunc ListenerFunc) Streamer {
+	return NewStreamWithConnection(pq.NewConnectionTemplate(dsn), cfg, plan, m, listenerFunc)
+}
+
+// NewSessionStream constructs a stream around a caller-owned replication
+// session and the package's standard metric collector.
+func NewSessionStream(conn pq.Connection, cfg config.Config, plan *capture.Plan, listenerFunc ListenerFunc) SessionStreamer {
+	return NewStreamWithConnection(conn, cfg, plan, metric.NewMetric(cfg.Slot.Name), listenerFunc)
+}
+
+func NewStreamWithConnection(conn pq.Connection, cfg config.Config, plan *capture.Plan, m metric.Metric, listenerFunc ListenerFunc) SessionStreamer {
 	doneCtx, finish := context.WithCancelCause(context.Background())
 	return &stream{
-		conn:         pq.NewConnectionTemplate(dsn),
+		conn:         conn,
 		metric:       m,
 		config:       cfg,
 		relation:     make(map[uint32]*format.Relation),
+		capturePlan:  plan,
 		messageCH:    make(chan *Message, 1000),
 		listenerFunc: listenerFunc,
 		sinkEnd:      make(chan struct{}),
@@ -103,6 +126,10 @@ func NewStream(dsn string, cfg config.Config, m metric.Metric, listenerFunc List
 func (s *stream) Connect(ctx context.Context) error {
 	if err := s.conn.Connect(ctx); err != nil {
 		return fmt.Errorf("stream connection: %w", err)
+	}
+	if err := capture.SetTextFormat(ctx, s.conn); err != nil {
+		_ = s.conn.Close(ctx)
+		return fmt.Errorf("stream text format: %w", err)
 	}
 
 	system, err := pq.IdentifySystem(ctx, s.conn)
@@ -141,22 +168,15 @@ func (s *stream) Open(ctx context.Context) error {
 }
 
 func (s *stream) setup(ctx context.Context) error {
+	if s.capturePlan != nil {
+		if err := s.capturePlan.Validate(ctx, s.conn, s.config.Publication.Name); err != nil {
+			return err
+		}
+	}
 	replication := New(s.conn)
 
 	replicationStartLsn := s.lastXLogPos
-	if s.openFromSnapshotLSN {
-		snapshotLSN := s.snapshotLSN
-		if snapshotLSN == 0 {
-			var err error
-			snapshotLSN, err = s.fetchSnapshotLSN(ctx)
-			if err != nil {
-				return fmt.Errorf("fetch snapshot LSN: %w", err)
-			}
-		}
-		replicationStartLsn = snapshotLSN
-	}
-
-	if err := replication.Start(s.config.Publication.Name, s.config.Slot.Name, replicationStartLsn, s.config.Slot.ProtoVersion); err != nil {
+	if err := replication.Start(s.config.Publication.Name, s.config.Slot.Name, replicationStartLsn, s.config.Slot.ProtoVersion, s.config.Slot.Messages); err != nil {
 		return err
 	}
 
@@ -164,11 +184,7 @@ func (s *stream) setup(ctx context.Context) error {
 		return err
 	}
 
-	if s.openFromSnapshotLSN {
-		logger.Info("replication started from snapshot LSN", "slot", s.config.Slot.Name, "lsn", replicationStartLsn.String())
-	} else {
-		logger.Info("replication started from confirmed_flush_lsn", "slot", s.config.Slot.Name)
-	}
+	logger.Info("replication started", "slot", s.config.Slot.Name, "lsn", replicationStartLsn.String())
 
 	return nil
 }
@@ -180,8 +196,9 @@ func (s *stream) setup(ctx context.Context) error {
 // All preceding messages are emitted immediately with their original position.
 // This keeps memory usage O(1) regardless of transaction size.
 type messageBuffer struct {
-	pending *Message
-	outCh   chan<- *Message
+	pending       *Message
+	outCh         chan<- *Message
+	inTransaction bool
 }
 
 func (b *messageBuffer) flush() {
@@ -219,42 +236,84 @@ func (b *messageBuffer) buffer(msg *Message) {
 // how PostgreSQL's own logical replication worker handles streaming: it writes
 // to temporary storage and only applies on commit.
 type streamTxBuffer struct {
-	txns      map[uint32][]*Message
+	txns      map[uint32]*streamedTx
 	activeXid uint32
 	streaming bool
+	deferred  []*Message
 }
 
-func (s *streamTxBuffer) startTx(xid uint32) {
+type streamedTx struct {
+	messages      []*Message
+	baseRelations map[uint32]*format.Relation
+	relations     map[uint32]*format.Relation
+}
+
+func (s *streamTxBuffer) startTx(xid uint32, relations map[uint32]*format.Relation) {
 	if s.txns == nil {
-		s.txns = make(map[uint32][]*Message)
+		s.txns = make(map[uint32]*streamedTx)
+	}
+	if _, exists := s.txns[xid]; !exists {
+		base := maps.Clone(relations)
+		s.txns[xid] = &streamedTx{baseRelations: base, relations: maps.Clone(base)}
 	}
 	s.activeXid = xid
 	s.streaming = true
 }
 
-func (s *streamTxBuffer) append(msg *Message) {
-	s.txns[s.activeXid] = append(s.txns[s.activeXid], msg)
+func (s *streamTxBuffer) append(msg *Message, xid uint32) {
+	msg.xid = xid
+	tx := s.txns[s.activeXid]
+	tx.messages = append(tx.messages, msg)
+}
+
+func (s *streamTxBuffer) relationCache() map[uint32]*format.Relation {
+	return s.txns[s.activeXid].relations
 }
 
 func (s *streamTxBuffer) stopTx() {
 	s.streaming = false
 }
 
-func (s *streamTxBuffer) flushTx(xid uint32, outCh chan<- *Message, endLSN pq.LSN) {
+func (s *streamTxBuffer) commitTx(xid uint32, endLSN pq.LSN) []*Message {
 	s.streaming = false
-	msgs := s.txns[xid]
+	tx := s.txns[xid]
+	msgs := tx.messages
 	if len(msgs) > 0 {
 		msgs[len(msgs)-1].ackLSN = endLSN
 	}
-	for _, msg := range msgs {
-		outCh <- msg
-	}
 	delete(s.txns, xid)
+	return msgs
 }
 
-func (s *streamTxBuffer) discardTx(xid uint32) {
+func (s *streamTxBuffer) abortTx(xid, subxid uint32) {
 	s.streaming = false
-	delete(s.txns, xid)
+	if xid == subxid {
+		delete(s.txns, xid)
+		return
+	}
+	tx := s.txns[xid]
+	for i, message := range tx.messages {
+		if message.xid == subxid {
+			tx.messages = tx.messages[:i]
+			tx.relations = maps.Clone(tx.baseRelations)
+			for _, retained := range tx.messages {
+				if relation, ok := retained.message.(*format.Relation); ok {
+					tx.relations[relation.OID] = relation
+				}
+			}
+			return
+		}
+	}
+}
+
+func (s *streamTxBuffer) flushDeferred(out chan<- *Message) {
+	if len(s.txns) > 0 {
+		return
+	}
+	for _, message := range s.deferred {
+		out <- message
+	}
+	s.deferred = nil
 }
 
 func (s *stream) sink(ctx context.Context) {
@@ -397,7 +456,11 @@ func (s *stream) handleXLogData(data []byte, buf *messageBuffer, streamBuf *stre
 	s.UpdateXLogPos(xld.ServerWALEnd)
 	s.metric.SetCDCLatency(time.Since(xld.ServerTime).Nanoseconds())
 
-	decodedMsg, err := message.New(xld.WALData, streamBuf.streaming, xld.ServerTime, s.relation)
+	relations := s.relation
+	if streamBuf.streaming {
+		relations = streamBuf.relationCache()
+	}
+	decodedMsg, err := message.New(xld.WALData, streamBuf.streaming, xld.ServerTime, relations)
 	if err != nil {
 		if ignorableLogicalMetadata(xld.WALData, err) {
 			logger.Debug("ignoring logical metadata message", "type", string(xld.WALData[0]))
@@ -407,6 +470,15 @@ func (s *stream) handleXLogData(data []byte, buf *messageBuffer, streamBuf *stre
 	}
 	if decodedMsg == nil {
 		return errors.New("logical message decoder returned nil without error")
+	}
+	if s.capturePlan != nil && !streamBuf.streaming {
+		if relation, ok := decodedMsg.(*format.Relation); ok {
+			if err := s.capturePlan.ValidateRelation(relation); err != nil {
+				return fmt.Errorf("validate relation: %w", err)
+			}
+		} else if err := s.capturePlan.NormalizeMessage(decodedMsg); err != nil {
+			return fmt.Errorf("normalize capture message: %w", err)
+		}
 	}
 
 	// add LSN to insert/update/delete messages
@@ -419,8 +491,7 @@ func (s *stream) handleXLogData(data []byte, buf *messageBuffer, streamBuf *stre
 		m.LSN = xld.WALStart
 	}
 
-	s.dispatchMessage(decodedMsg, xld, buf, streamBuf)
-	return nil
+	return s.dispatchMessage(decodedMsg, xld, buf, streamBuf)
 }
 
 func ignorableLogicalMetadata(data []byte, err error) bool {
@@ -442,10 +513,11 @@ func ignorableLogicalMetadata(data []byte, err error) bool {
 // streamTxBuffer across STREAM START / STREAM STOP chunks. They are only
 // emitted to the consumer on STREAM COMMIT and discarded on STREAM ABORT.
 // This prevents uncommitted data from being delivered.
-func (s *stream) dispatchMessage(decodedMsg any, xld XLogData, buf *messageBuffer, streamBuf *streamTxBuffer) {
+func (s *stream) dispatchMessage(decodedMsg any, xld XLogData, buf *messageBuffer, streamBuf *streamTxBuffer) error {
 	switch msg := decodedMsg.(type) {
 	case *format.Begin:
 		buf.discard()
+		buf.inTransaction = true
 		if s.config.Listener.EmitTransactionBoundaries {
 			buf.outCh <- &Message{message: msg, walStart: xld.WALStart, ackLSN: xld.WALStart}
 		}
@@ -455,21 +527,65 @@ func (s *stream) dispatchMessage(decodedMsg any, xld XLogData, buf *messageBuffe
 		if s.config.Listener.EmitTransactionBoundaries {
 			buf.outCh <- &Message{message: msg, walStart: xld.WALStart, ackLSN: msg.TransactionEndLSN}
 		}
+		buf.inTransaction = false
+		streamBuf.flushDeferred(buf.outCh)
 
 	case *format.StreamStart:
-		streamBuf.startTx(msg.Xid)
+		streamBuf.startTx(msg.Xid, s.relation)
 
 	case *format.StreamStop:
 		streamBuf.stopTx()
 
 	case *format.StreamCommit:
-		streamBuf.flushTx(msg.Xid, buf.outCh, msg.TransactionEndLSN)
+		messages := streamBuf.commitTx(msg.Xid, msg.TransactionEndLSN)
+		if err := s.commitStreamedMessages(messages); err != nil {
+			return err
+		}
 		if s.config.Listener.EmitTransactionBoundaries {
-			buf.outCh <- &Message{message: msg, walStart: xld.WALStart, ackLSN: msg.TransactionEndLSN}
+			buf.outCh <- &Message{message: &format.Begin{FinalLSN: msg.CommitLSN, CommitTime: msg.CommitTime, Xid: msg.Xid}, walStart: xld.WALStart, ackLSN: xld.WALStart}
+		}
+		for _, message := range messages {
+			buf.outCh <- message
+		}
+		if s.config.Listener.EmitTransactionBoundaries {
+			buf.outCh <- &Message{message: &format.Commit{Flags: msg.Flags, CommitLSN: msg.CommitLSN, TransactionEndLSN: msg.TransactionEndLSN, CommitTime: msg.CommitTime}, walStart: xld.WALStart, ackLSN: msg.TransactionEndLSN}
+		}
+		if !buf.inTransaction {
+			streamBuf.flushDeferred(buf.outCh)
 		}
 
 	case *format.StreamAbort:
-		streamBuf.discardTx(msg.Xid)
+		streamBuf.abortTx(msg.Xid, msg.SubXid)
+		if !buf.inTransaction {
+			streamBuf.flushDeferred(buf.outCh)
+		}
+
+	case *format.LogicalMessage:
+		message := &Message{message: msg, walStart: xld.WALStart, ackLSN: xld.WALStart}
+		if msg.Transactional {
+			if streamBuf.streaming {
+				streamBuf.append(message, msg.XID)
+			} else {
+				buf.buffer(message)
+			}
+			return nil
+		}
+		message.autoAck = s.config.Listener.EmitTransactionBoundaries
+		if message.autoAck && (buf.inTransaction || len(streamBuf.txns) > 0) {
+			streamBuf.deferred = append(streamBuf.deferred, message)
+		} else {
+			buf.outCh <- message
+		}
+
+	case *format.Relation:
+		message := &Message{message: msg, walStart: xld.WALStart, ackLSN: xld.WALStart}
+		if streamBuf.streaming {
+			streamBuf.relationCache()[msg.OID] = msg
+			streamBuf.append(message, msg.XID)
+		} else {
+			s.relation[msg.OID] = msg
+			buf.buffer(message)
+		}
 
 	default:
 		m := &Message{
@@ -478,10 +594,50 @@ func (s *stream) dispatchMessage(decodedMsg any, xld XLogData, buf *messageBuffe
 			ackLSN:   xld.WALStart,
 		}
 		if streamBuf.streaming {
-			streamBuf.append(m)
+			streamBuf.append(m, streamedMessageXID(decodedMsg))
 		} else {
 			buf.buffer(m)
 		}
+	}
+	return nil
+}
+
+func (s *stream) commitStreamedMessages(messages []*Message) error {
+	for _, message := range messages {
+		if relation, ok := message.message.(*format.Relation); ok {
+			if s.capturePlan != nil {
+				if err := s.capturePlan.ValidateRelation(relation); err != nil {
+					return fmt.Errorf("validate relation: %w", err)
+				}
+			}
+		} else if s.capturePlan != nil {
+			if err := s.capturePlan.NormalizeMessage(message.message); err != nil {
+				return fmt.Errorf("normalize capture message: %w", err)
+			}
+		}
+	}
+	for _, message := range messages {
+		if relation, ok := message.message.(*format.Relation); ok {
+			s.relation[relation.OID] = relation
+		}
+	}
+	return nil
+}
+
+func streamedMessageXID(message any) uint32 {
+	switch message := message.(type) {
+	case *format.Insert:
+		return message.XID
+	case *format.Update:
+		return message.XID
+	case *format.Delete:
+		return message.XID
+	case *format.Truncate:
+		return message.XID
+	case *format.Relation:
+		return message.XID
+	default:
+		return 0
 	}
 }
 
@@ -499,6 +655,12 @@ func (s *stream) process(ctx context.Context) {
 		}
 
 		ackFunc := s.ackFuncForMessage(msg, ackTracker)
+		if msg.autoAck {
+			if err := ackFunc(); err != nil {
+				s.finish(fmt.Errorf("logical message auto-ack: %w", err))
+			}
+			continue
+		}
 		if s.isHeartbeatMessage(msg.message) {
 			if err := ackFunc(); err != nil {
 				s.finish(fmt.Errorf("heartbeat auto-ack: %w", err))
@@ -573,9 +735,14 @@ func (s *stream) ackFuncForMessage(msg *Message, tracker *transactionAckTracker)
 	transactionAware := s.config.Listener.EmitTransactionBoundaries
 	var checkpoint *transactionAckCheckpoint
 	if transactionAware {
-		switch msg.message.(type) {
-		case *format.Commit, *format.StreamCommit:
+		switch {
+		case msg.autoAck:
 			checkpoint = tracker.register(msg.ackLSN)
+		default:
+			switch msg.message.(type) {
+			case *format.Commit:
+				checkpoint = tracker.register(msg.ackLSN)
+			}
 		}
 	}
 
@@ -666,6 +833,18 @@ func (s *stream) Close(ctx context.Context) {
 	})
 }
 
+func (s *stream) Wait(ctx context.Context) error {
+	if !s.processStarted.Load() {
+		return nil
+	}
+	select {
+	case <-s.processEnd:
+		return nil
+	case <-ctx.Done():
+		return context.Cause(ctx)
+	}
+}
+
 func (s *stream) Done() <-chan struct{} {
 	return s.doneCtx.Done()
 }
@@ -712,51 +891,10 @@ func (s *stream) LoadConfirmedXLogPos() pq.LSN {
 	return s.confirmedXLogPos
 }
 
-func (s *stream) OpenFromSnapshotLSN() {
-	s.openFromSnapshotLSN = true
-}
-
-// OpenFromSnapshotLSNAt starts from the checkpoint returned by the snapshot
-// generation that was just delivered, avoiding a later mutable metadata read.
-func (s *stream) OpenFromSnapshotLSNAt(lsn pq.LSN) {
-	s.openFromSnapshotLSN = true
-	s.snapshotLSN = lsn
-}
-
-// fetchSnapshotLSN preserves the public no-argument API for callers that
-// coordinate snapshot execution outside Connector. Connector passes the exact
-// delivered generation through OpenFromSnapshotLSNAt instead.
-func (s *stream) fetchSnapshotLSN(ctx context.Context) (pq.LSN, error) {
-	conn, err := pq.NewConnection(ctx, s.config.DSN())
-	if err != nil {
-		return 0, fmt.Errorf("connect for snapshot LSN: %w", err)
-	}
-	defer func() {
-		closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_ = conn.Close(closeCtx)
-	}()
-
-	query := fmt.Sprintf(`
-		SELECT snapshot_lsn
-		FROM cdc_snapshot_job
-		WHERE slot_name = %s
-		AND completed
-	`, pq.QuoteLiteral(s.config.Slot.Name))
-	results, err := pq.ExecQuery(ctx, conn, query)
-	if err != nil {
-		return 0, fmt.Errorf("read snapshot LSN: %w", err)
-	}
-	if len(results) == 0 || len(results[0].Rows) == 0 || len(results[0].Rows[0]) == 0 {
-		return 0, fmt.Errorf("completed snapshot job not found for slot %q", s.config.Slot.Name)
-	}
-
-	lsn, err := pq.ParseLSN(string(results[0].Rows[0][0]))
-	if err != nil {
-		return 0, fmt.Errorf("parse snapshot LSN: %w", err)
-	}
-	logger.Info("fetched snapshot LSN", "slotName", s.config.Slot.Name, "snapshotLSN", lsn.String())
-	return lsn, nil
+func (s *stream) OpenAt(ctx context.Context, lsn pq.LSN) error {
+	s.UpdateXLogPos(lsn)
+	s.UpdateConfirmedXLogPos(lsn)
+	return s.Open(ctx)
 }
 
 func (s *stream) requestFeedback() {
@@ -770,7 +908,8 @@ func (s *stream) requestFeedback() {
 // sink has stopped during final cleanup. This keeps replication socket writes
 // single-owned without a connection mutex.
 func (s *stream) sendStandbyStatusUpdate(ctx context.Context) error {
-	return SendStandbyStatusUpdate(ctx, s.conn, uint64(s.LoadXLogPos()), uint64(s.LoadConfirmedXLogPos()))
+	confirmed := s.LoadConfirmedXLogPos()
+	return SendStandbyStatusUpdate(ctx, s.conn, uint64(confirmed), uint64(confirmed))
 }
 
 func SendStandbyStatusUpdate(_ context.Context, conn pq.Connection, walReceivedPosition, walFlushedPosition uint64) error {

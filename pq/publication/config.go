@@ -9,11 +9,13 @@ import (
 )
 
 type Config struct {
-	Name              string     `json:"name" yaml:"name"`
-	Operations        Operations `json:"operations" yaml:"operations"`
-	Tables            Tables     `json:"tables" yaml:"tables"`
-	CreateIfNotExists bool       `json:"createIfNotExists" yaml:"createIfNotExists"`
-	AllTables         bool       `json:"-" yaml:"-"`
+	Name                    string     `json:"name" yaml:"name"`
+	Operations              Operations `json:"operations" yaml:"operations"`
+	Tables                  Tables     `json:"tables" yaml:"tables"`
+	CreateIfNotExists       bool       `json:"createIfNotExists" yaml:"createIfNotExists"`
+	AllTables               bool       `json:"-" yaml:"-"`
+	SchemaTables            bool       `json:"-" yaml:"-"`
+	PublishViaPartitionRoot bool       `json:"-" yaml:"-"`
 }
 
 func (c Config) Validate() error {
@@ -21,19 +23,12 @@ func (c Config) Validate() error {
 	if strings.TrimSpace(c.Name) == "" {
 		err = errors.Join(err, errors.New("publication name cannot be empty"))
 	}
-
-	if !c.CreateIfNotExists {
-		return err
-	}
-
 	if validateErr := c.Tables.Validate(); validateErr != nil {
 		err = errors.Join(err, validateErr)
 	}
-
 	if validateErr := c.Operations.Validate(); validateErr != nil {
 		err = errors.Join(err, validateErr)
 	}
-
 	return err
 }
 
@@ -47,15 +42,19 @@ func (c Config) createQuery() string {
 			hasPartitionedTable = true
 		}
 
+		tableName := pq.QuoteQualifiedName(table.Schema, table.Name)
+		if !table.Partitioned {
+			tableName = "ONLY " + tableName
+		}
 		if len(table.Columns) > 0 {
-			quotedTables[i] = fmt.Sprintf("%s(%s)", pq.QuoteQualifiedName(table.Schema, table.Name), quoteColumnList(table.Columns))
+			quotedTables[i] = fmt.Sprintf("%s(%s)", tableName, quoteColumnList(table.Columns))
 		} else {
-			quotedTables[i] = pq.QuoteQualifiedName(table.Schema, table.Name)
+			quotedTables[i] = tableName
 		}
 	}
 	sqlStatement += " FOR TABLE " + strings.Join(quotedTables, ", ")
 
-	sqlStatement += fmt.Sprintf(" WITH (publish = %s, publish_via_partition_root = %t)", pq.QuoteLiteral(c.Operations.String()), hasPartitionedTable)
+	sqlStatement += fmt.Sprintf(" WITH (publish = %s, publish_via_partition_root = %t)", pq.QuoteLiteral(strings.ToLower(c.Operations.String())), hasPartitionedTable)
 
 	return sqlStatement
 }
@@ -69,35 +68,32 @@ func quoteColumnList(columns []string) string {
 }
 
 func (c Config) infoQuery() string {
-	q := fmt.Sprintf(`WITH publication_details AS (
-    SELECT
-        p.oid AS pubid,
-        p.pubname,
-        p.puballtables,
-        p.pubinsert,
-        p.pubupdate,
-        p.pubdelete,
-        p.pubtruncate
-    FROM pg_publication p
-    WHERE p.pubname = %s
-	),
-	expanded_tables AS (
+	return fmt.Sprintf(`
 		SELECT
-			pubname,
-			array_agg(schemaname || '.' || tablename) AS tables
-		FROM pg_publication_tables
-		WHERE pubname = %s
-		GROUP BY pubname
-	)
-	SELECT
-		pd.pubname,
-		pd.puballtables,
-		pd.pubinsert,
-		pd.pubupdate,
-		pd.pubdelete,
-		pd.pubtruncate,
-		COALESCE(et.tables, ARRAY[]::text[]) AS pubtables
-	FROM publication_details pd
-	LEFT JOIN expanded_tables et ON pd.pubname = et.pubname;`, pq.QuoteLiteral(c.Name), pq.QuoteLiteral(c.Name))
-	return q
+			p.pubname,
+			p.puballtables,
+			p.pubinsert,
+			p.pubupdate,
+			p.pubdelete,
+			p.pubtruncate,
+			p.pubviaroot,
+			EXISTS (
+				SELECT 1 FROM pg_publication_namespace pn WHERE pn.pnpubid = p.oid
+			) AS pubschemas,
+			pt.schemaname,
+			pt.tablename,
+			COALESCE(pt.attnames::text[], ARRAY[]::text[]) AS columns,
+			(pr.prattrs IS NOT NULL) AS columns_specified,
+			COALESCE(pt.rowfilter, '') AS row_filter,
+			c.relreplident::text AS replica_identity,
+			COALESCE(idx.relname, '') AS replica_identity_index
+		FROM pg_publication p
+		LEFT JOIN pg_publication_tables pt ON pt.pubname = p.pubname
+		LEFT JOIN pg_namespace n ON n.nspname = pt.schemaname
+		LEFT JOIN pg_class c ON c.relnamespace = n.oid AND c.relname = pt.tablename
+		LEFT JOIN pg_publication_rel pr ON pr.prpubid = p.oid AND pr.prrelid = c.oid
+		LEFT JOIN pg_index i ON i.indrelid = c.oid AND i.indisreplident
+		LEFT JOIN pg_class idx ON idx.oid = i.indexrelid
+		WHERE p.pubname = %s
+		ORDER BY pt.schemaname, pt.tablename`, pq.QuoteLiteral(c.Name))
 }

@@ -60,7 +60,7 @@ func TestNewDecodesStreamedRelation(t *testing.T) {
 	assert.Equal(t, "t", rel.Name)
 	require.Len(t, rel.Columns, 1)
 	assert.Equal(t, "id", rel.Columns[0].Name)
-	assert.Equal(t, rel, relations[16390])
+	assert.NotContains(t, relations, uint32(16390))
 }
 
 func TestNewWrapsUnsupportedMessageSentinel(t *testing.T) {

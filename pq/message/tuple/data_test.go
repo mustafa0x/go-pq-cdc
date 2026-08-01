@@ -133,7 +133,7 @@ func TestData_DecodeWithColumn(t *testing.T) {
 			{Name: "description", DataType: pgtype.TextOID},
 		}
 
-		decoded, err := d.DecodeWithColumn(relationColumns)
+		decoded, err := d.DecodeWithColumn(relationColumns, 'O')
 		require.NoError(t, err)
 		assert.NotNil(t, decoded)
 		assert.Equal(t, int32(123), decoded["id"])
@@ -146,16 +146,27 @@ func TestData_DecodeWithColumn(t *testing.T) {
 			{Name: "description", DataType: pgtype.TextOID},
 		}
 
-		decoded, err := d.DecodeWithColumn(relationColumns)
+		decoded, err := d.DecodeWithColumn(relationColumns, 'O')
 		require.NoError(t, err)
 		assert.Equal(t, "123", decoded["unknown_col"]) // Fallback to string
 	})
 
 	t.Run("returns error when relation has fewer columns than tuple", func(t *testing.T) {
-		decoded, err := d.DecodeWithColumn([]RelationColumn{{Name: "id", DataType: pgtype.Int4OID}})
+		decoded, err := d.DecodeWithColumn([]RelationColumn{{Name: "id", DataType: pgtype.Int4OID}}, 'O')
 
 		require.Error(t, err)
 		assert.Nil(t, decoded)
 		assert.Contains(t, err.Error(), "exceeds relation column count")
+	})
+
+	t.Run("should omit non-key placeholders from key tuples", func(t *testing.T) {
+		relationColumns := []RelationColumn{
+			{Name: "id", DataType: pgtype.Int4OID, Flags: 1},
+			{Name: "description", DataType: pgtype.TextOID},
+		}
+
+		decoded, err := d.DecodeWithColumn(relationColumns, 'K')
+		require.NoError(t, err)
+		assert.Equal(t, map[string]any{"id": int32(123)}, decoded)
 	})
 }

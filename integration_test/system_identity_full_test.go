@@ -299,7 +299,7 @@ func TestReplicaIdentityUsingIndexUpdateUsesKeyTuple(t *testing.T) {
 
 		select {
 		case msg := <-updates:
-			assert.Equal(t, uint8(format.UpdateTupleTypeKey), msg.OldTupleType)
+			assert.Equal(t, uint8(format.TupleTypeKey), msg.OldTupleType)
 			assert.NotNil(t, msg.OldDecoded)
 			assert.Len(t, msg.OldDecoded, 2)
 			assert.Nil(t, msg.OldDecoded["id"])

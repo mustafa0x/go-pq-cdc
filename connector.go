@@ -10,17 +10,12 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/Trendyol/go-pq-cdc/pq/heartbeat"
-	"github.com/Trendyol/go-pq-cdc/pq/message/format"
-	"github.com/Trendyol/go-pq-cdc/pq/snapshot"
-
-	"github.com/Trendyol/go-pq-cdc/pq/timescaledb"
-
 	"github.com/Trendyol/go-pq-cdc/config"
 	"github.com/Trendyol/go-pq-cdc/internal/http"
 	"github.com/Trendyol/go-pq-cdc/internal/metric"
 	"github.com/Trendyol/go-pq-cdc/logger"
 	"github.com/Trendyol/go-pq-cdc/pq"
+	"github.com/Trendyol/go-pq-cdc/pq/heartbeat"
 	"github.com/Trendyol/go-pq-cdc/pq/publication"
 	"github.com/Trendyol/go-pq-cdc/pq/replication"
 	"github.com/Trendyol/go-pq-cdc/pq/slot"
@@ -40,7 +35,6 @@ type Connector interface {
 type runningStreamer interface {
 	replication.Streamer
 	slot.XLogUpdater
-	OpenFromSnapshotLSNAt(pq.LSN)
 	Done() <-chan struct{}
 	Err() error
 }
@@ -55,12 +49,9 @@ type connector struct {
 	prometheusRegistry metric.Registry
 	server             http.Server
 	stream             runningStreamer
-	timescaleDB        *timescaledb.TimescaleDB
 	slot               *slot.Slot
 	readyCh            chan struct{}
 	cfg                *config.Config
-	snapshotter        *snapshot.Snapshotter
-	listenerFunc       replication.ListenerFunc
 	stopOnce           sync.Once
 	cleanupOnce        sync.Once
 	runMu              sync.Mutex
@@ -96,12 +87,6 @@ func NewConnector(ctx context.Context, cfg config.Config, listenerFunc replicati
 	logger.InitLogger(cfg.Logger.Logger)
 	cfg.Print()
 
-	// Snapshot-only mode: minimal setup without CDC components
-	if cfg.IsSnapshotOnlyMode() {
-		return newSnapshotOnlyConnector(ctx, cfg, listenerFunc)
-	}
-
-	// Normal CDC mode: full setup with publication, slot, stream
 	// Normal connection for publication setup
 	// This uses regular DSN (no replication parameter) to avoid consuming max_wal_senders limit
 	conn, err := pq.NewConnection(ctx, cfg.DSN())
@@ -114,29 +99,32 @@ func NewConnector(ctx context.Context, cfg config.Config, listenerFunc replicati
 		_ = conn.Close(closeCtx)
 	}()
 
-	hb, publicationInfo, err := setupHeartbeatAndPublication(ctx, cfg, conn)
+	hb, err := validateHeartbeat(ctx, cfg, conn)
 	if err != nil {
 		return nil, err
 	}
+
+	capturePlan, err := cfg.CapturePlan(ctx, conn)
+	if err != nil {
+		return nil, fmt.Errorf("compile capture plan: %w", err)
+	}
+	cfg.Publication = capturePlan.PublicationConfig(cfg.Publication.Name, cfg.Publication.CreateIfNotExists)
+	publicationInfo, err := publication.New(cfg.Publication, conn).Create(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("create or inspect publication: %w", err)
+	}
+	if err := capturePlan.Validate(ctx, conn, cfg.Publication.Name); err != nil {
+		return nil, err
+	}
+	if err := cfg.ValidateHeartbeatInPublication(publicationInfo); err != nil {
+		return nil, err
+	}
+	logger.Info("publication", "info", publicationInfo)
 
 	m := metric.NewMetric(cfg.Slot.Name)
 
-	// Get tables to snapshot (either from snapshot.tables or publication.tables)
-	snapshotTables, err := cfg.GetSnapshotTables(publicationInfo)
-	if err != nil {
-		return nil, fmt.Errorf("get snapshot tables: %w", err)
-	}
-
-	snapshotter, err := initializeSnapshot(ctx, cfg, snapshotTables, m)
-	if err != nil {
-		return nil, err
-	}
-
-	stream, ok := replication.NewStream(cfg.ReplicationDSN(), cfg, m, listenerFunc).(runningStreamer)
+	stream, ok := replication.NewStream(cfg.ReplicationDSN(), cfg, capturePlan, m, listenerFunc).(runningStreamer)
 	if !ok {
-		if snapshotter != nil {
-			snapshotter.Close(ctx)
-		}
 		return nil, errors.New("replication stream does not expose required connector capabilities")
 	}
 
@@ -151,108 +139,23 @@ func NewConnector(ctx context.Context, cfg config.Config, listenerFunc replicati
 		server:             http.NewServer(cfg, prometheusRegistry, sl),
 		slot:               sl,
 		heartbeat:          hb,
-		snapshotter:        snapshotter,
-		listenerFunc:       listenerFunc,
 		readyCh:            make(chan struct{}),
 		stopCh:             make(chan struct{}),
-	}
-
-	c.timescaleDB, err = initializeTimescaleDB(ctx, cfg)
-	if err != nil {
-		c.Close()
-		return nil, err
 	}
 
 	return c, nil
 }
 
-// newSnapshotOnlyConnector creates a minimal connector for snapshot-only mode
-// without CDC components (publication, slot, replication stream)
-func newSnapshotOnlyConnector(ctx context.Context, cfg config.Config, listenerFunc replication.ListenerFunc) (Connector, error) {
-	// Use a dummy metric name since we don't have a slot
-	m := metric.NewMetric("snapshot_only")
-
-	// Get tables to snapshot from snapshot.tables
-	snapshotTables, err := cfg.GetSnapshotTables(nil) // nil publicationInfo for snapshot_only mode
-	if err != nil {
-		return nil, fmt.Errorf("get snapshot tables: %w", err)
-	}
-
-	// Initialize snapshotter with tables from snapshot config
-	snapshotter, err := initializeSnapshot(ctx, cfg, snapshotTables, m)
-	if err != nil {
-		return nil, err
-	}
-
-	prometheusRegistry := metric.NewRegistry(m)
-
-	logger.Info("snapshot-only mode enabled", "tables", len(snapshotTables))
-
-	return &connector{
-		cfg:                &cfg,
-		prometheusRegistry: prometheusRegistry,
-		server:             http.NewServer(cfg, prometheusRegistry, nil),
-		snapshotter:        snapshotter,
-		listenerFunc:       listenerFunc,
-		readyCh:            make(chan struct{}),
-		stopCh:             make(chan struct{}),
-		// CDC components left nil: system, stream, slot
-	}, nil
-}
-
-func setupHeartbeatAndPublication(ctx context.Context, cfg config.Config, conn pq.Connection) (*heartbeat.Heartbeat, *publication.Config, error) {
-	var hb *heartbeat.Heartbeat
-	if cfg.IsHeartbeatEnabled() {
-		hb = heartbeat.New(cfg.DSN(), cfg.Heartbeat)
-		if err := hb.EnsureTable(ctx, conn); err != nil {
-			return nil, nil, fmt.Errorf("create heartbeat table: %w", err)
-		}
-	}
-
-	publicationInfo, err := initializePublication(ctx, cfg, conn)
-	if err != nil {
-		return nil, nil, err
-	}
-	if err := cfg.ValidateHeartbeatInPublication(publicationInfo); err != nil {
-		return nil, nil, err
-	}
-	logger.Info("publication", "info", publicationInfo)
-	return hb, publicationInfo, nil
-}
-
-func initializeTimescaleDB(ctx context.Context, cfg config.Config) (*timescaledb.TimescaleDB, error) {
-	if !cfg.ExtensionSupport.EnableTimeScaleDB {
+func validateHeartbeat(ctx context.Context, cfg config.Config, conn pq.Connection) (*heartbeat.Heartbeat, error) {
+	if !cfg.IsHeartbeatEnabled() {
 		return nil, nil
 	}
-	tdb, err := timescaledb.NewTimescaleDB(ctx, cfg.DSN())
-	if err != nil {
-		return nil, err
-	}
-	if _, err = tdb.FindHyperTables(ctx); err != nil {
-		tdb.Close(ctx)
-		return nil, err
-	}
-	return tdb, nil
-}
 
-// initializePublication sets up and creates the publication
-func initializePublication(ctx context.Context, cfg config.Config, conn pq.Connection) (*publication.Config, error) {
-	pub := publication.New(cfg.Publication, conn)
-	if err := pub.SetReplicaIdentities(ctx); err != nil {
-		return nil, err
+	hb := heartbeat.New(cfg.DSN(), cfg.Heartbeat)
+	if err := hb.ValidateTable(ctx, conn); err != nil {
+		return nil, fmt.Errorf("validate heartbeat table: %w", err)
 	}
-	return pub.Create(ctx)
-}
-
-// initializeSnapshot creates snapshot if enabled
-// tables parameter should come from publicationInfo (not from config) to support both scenarios:
-// 1. When user provides tables in config (createIfNotExists: true)
-// 2. When user uses existing publication without specifying tables (createIfNotExists: false)
-func initializeSnapshot(ctx context.Context, cfg config.Config, tables publication.Tables, m metric.Metric) (*snapshot.Snapshotter, error) {
-	if !cfg.Snapshot.Enabled {
-		return nil, nil
-	}
-	return snapshot.New(ctx, cfg.Snapshot, tables, cfg.DSN(), m)
+	return hb, nil
 }
 
 func (c *connector) Start(parent context.Context) (err error) {
@@ -291,49 +194,12 @@ func (c *connector) Start(parent context.Context) (err error) {
 
 	go c.server.Listen()
 
-	if c.cfg.IsSnapshotOnlyMode() {
-		slotName := c.cfg.Snapshot.ID
-		if slotName == "" {
-			slotName = "snapshot_only_" + c.cfg.Database
-		}
-		takeSnapshot, err := c.shouldTakeSnapshot(ctx, slotName)
-		if err != nil {
-			return err
-		}
-		if !takeSnapshot {
-			logger.Info("snapshot-only already completed, exiting")
-			c.signalReady()
-			return nil
-		}
-
-		logger.Info("starting snapshot-only execution", "slotName", slotName)
-		if err := c.executeSnapshotWithRetry(ctx, slotName); err != nil {
-			logger.Error("snapshot-only execution failed", "error", err)
-			return fmt.Errorf("run snapshot: %w", err)
-		}
-		logger.Info("snapshot-only completed successfully, exiting")
-		c.signalReady()
-		return nil
-	}
-
-	takeSnapshot, err := c.shouldTakeSnapshot(ctx, c.cfg.Slot.Name)
+	logger.Info("creating or adopting replication slot")
+	slotInfo, err := c.slot.Create(ctx)
 	if err != nil {
-		return err
+		return fmt.Errorf("create replication slot: %w", err)
 	}
-	if takeSnapshot {
-		if err := c.prepareSnapshotAndSlot(ctx); err != nil {
-			logger.Error("snapshot preparation failed", "error", err)
-			return err
-		}
-	} else {
-		logger.Info("creating replication slot for CDC")
-		slotInfo, err := c.slot.Create(ctx)
-		if err != nil {
-			logger.Error("slot creation failed", "error", err)
-			return err
-		}
-		logger.Info("slot info", "info", slotInfo)
-	}
+	logger.Info("slot info", "info", slotInfo)
 
 	if err := c.errIfStopped(ctx); err != nil {
 		logger.Debug("connector start canceled before slot connect", "error", err)
@@ -370,10 +236,6 @@ func (c *connector) Start(parent context.Context) (err error) {
 
 	if c.heartbeat != nil {
 		go c.heartbeat.Run(ctx)
-	}
-
-	if c.timescaleDB != nil {
-		go c.timescaleDB.SyncHyperTables(ctx)
 	}
 
 	c.signalReady()
@@ -449,95 +311,9 @@ func (c *connector) signalReady() {
 	close(c.readyCh)
 }
 
-func (c *connector) shouldTakeSnapshot(ctx context.Context, slotName string) (bool, error) {
-	if !c.cfg.Snapshot.Enabled || c.cfg.Snapshot.Mode == config.SnapshotModeNever {
-		return false, nil
-	}
-	if err := c.snapshotter.EnsureMetadataTables(ctx); err != nil {
-		return false, fmt.Errorf("initialize snapshot metadata: %w", err)
-	}
-	if c.cfg.Snapshot.Resnapshot {
-		logger.Info("resnapshot enabled, reconciling requested generation", "slotName", slotName, "resnapshotID", c.cfg.Snapshot.ResnapshotID)
-		shouldTakeSnapshot, err := c.snapshotter.ReconcileResnapshot(ctx, slotName)
-		if err != nil {
-			return false, fmt.Errorf("reconcile resnapshot: %w", err)
-		}
-		return shouldTakeSnapshot, nil
-	}
-
-	job, err := c.snapshotter.LoadJob(ctx, slotName)
-	if err != nil {
-		return false, fmt.Errorf("load snapshot job: %w", err)
-	}
-	return job == nil || !job.Completed, nil
-}
-
-// prepareSnapshotAndSlot creates the replication slot before exporting and processing the snapshot.
-func (c *connector) prepareSnapshotAndSlot(ctx context.Context) error {
-	if err := c.errIfStopped(ctx); err != nil {
-		return err
-	}
-
-	slotInfo, err := c.slot.Create(ctx)
-	if err != nil {
-		return fmt.Errorf("create slot: %w", err)
-	}
-	logger.Debug("replication slot created, WAL preserved", "slotName", slotInfo.Name, "restartLSN", slotInfo.RestartLSN.String())
-
-	if err := c.executeSnapshotWithRetry(ctx, c.cfg.Slot.Name); err != nil {
-		return fmt.Errorf("run snapshot: %w", err)
-	}
-
-	logger.Info("snapshot completed successfully")
-	return nil
-}
-
-// executeSnapshotWithRetry retries only when the exported snapshot was invalidated.
-// Every retry prepares a fresh snapshot before replaying snapshot rows.
-func (c *connector) executeSnapshotWithRetry(ctx context.Context, slotName string) error {
-	const (
-		maxRetries   = 5
-		initialDelay = 10 * time.Second
-		maxDelay     = 60 * time.Second
-	)
-
-	retryDelay := initialDelay
-	for attempt := 1; ; attempt++ {
-		err := c.snapshotter.Prepare(ctx, slotName)
-		if err == nil {
-			var snapshotLSN pq.LSN
-			snapshotLSN, err = c.snapshotter.ExecuteWithLSN(ctx, c.snapshotHandler(ctx), slotName)
-			if err == nil && !c.cfg.IsSnapshotOnlyMode() {
-				c.stream.OpenFromSnapshotLSNAt(snapshotLSN)
-			}
-		}
-		if err == nil {
-			return nil
-		}
-		if !errors.Is(err, snapshot.ErrSnapshotInvalidated) {
-			return err
-		}
-		if attempt == maxRetries {
-			return fmt.Errorf("snapshot execution failed after maximum retries: %w", err)
-		}
-
-		logger.Warn("[snapshot] snapshot invalidated, retrying",
-			"slot", slotName,
-			"attempt", attempt,
-			"maxRetries", maxRetries,
-			"retryIn", retryDelay)
-		if err := c.waitWithContext(ctx, retryDelay); err != nil {
-			return err
-		}
-		retryDelay = min(retryDelay*2, maxDelay)
-	}
-}
-
-// waitWithContext waits for duration or connector cancellation.
 func (c *connector) waitWithContext(ctx context.Context, duration time.Duration) error {
 	timer := time.NewTimer(duration)
 	defer timer.Stop()
-
 	select {
 	case <-ctx.Done():
 		return context.Cause(ctx)
@@ -545,19 +321,6 @@ func (c *connector) waitWithContext(ctx context.Context, duration time.Duration)
 		return context.Canceled
 	case <-timer.C:
 		return nil
-	}
-}
-
-func (c *connector) snapshotHandler(ctx context.Context) snapshot.Handler {
-	return func(event *format.Snapshot) error {
-		if err := context.Cause(ctx); err != nil {
-			return err
-		}
-		c.listenerFunc(&replication.ListenerContext{
-			Message: event,
-			Ack:     func() error { return nil },
-		})
-		return context.Cause(ctx)
 	}
 }
 
@@ -616,14 +379,8 @@ func (c *connector) cleanup() {
 		if c.stream != nil {
 			c.stream.Close(cleanupCtx)
 		}
-		if c.snapshotter != nil {
-			c.snapshotter.Close(cleanupCtx)
-		}
 		if c.heartbeat != nil {
 			c.heartbeat.Close(cleanupCtx)
-		}
-		if c.timescaleDB != nil {
-			c.timescaleDB.Close(cleanupCtx)
 		}
 		if c.slot != nil {
 			c.slot.Close(cleanupCtx)

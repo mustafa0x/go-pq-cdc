@@ -17,7 +17,7 @@ import (
 )
 
 func TestDispatchDefaultKeepsRowOrientedListenerContract(t *testing.T) {
-	stream := NewStream("", config.Config{}, metric.NewMetric("test_slot"), func(*ListenerContext) {}).(*stream)
+	stream := NewStream("", config.Config{}, nil, metric.NewMetric("test_slot"), func(*ListenerContext) {}).(*stream)
 	out := make(chan *Message, 4)
 	buf := &messageBuffer{outCh: out}
 	streamBuf := &streamTxBuffer{}
@@ -41,26 +41,28 @@ func TestDispatchDefaultKeepsRowOrientedListenerContract(t *testing.T) {
 
 func TestDispatchCanEmitTransactionBoundaries(t *testing.T) {
 	cfg := config.Config{Listener: config.ListenerConfig{EmitTransactionBoundaries: true}}
-	stream := NewStream("", cfg, metric.NewMetric("test_slot"), func(*ListenerContext) {}).(*stream)
+	stream := NewStream("", cfg, nil, metric.NewMetric("test_slot"), func(*ListenerContext) {}).(*stream)
 	out := make(chan *Message, 8)
 	buf := &messageBuffer{outCh: out}
 	streamBuf := &streamTxBuffer{}
 
 	stream.dispatchMessage(&format.Begin{FinalLSN: pq.LSN(19)}, XLogData{WALStart: pq.LSN(10)}, buf, streamBuf)
 	stream.dispatchMessage(&format.Insert{TableName: "books"}, XLogData{WALStart: pq.LSN(11)}, buf, streamBuf)
-	stream.dispatchMessage(&format.Update{TableName: "books"}, XLogData{WALStart: pq.LSN(12)}, buf, streamBuf)
-	stream.dispatchMessage(&format.Commit{TransactionEndLSN: pq.LSN(20)}, XLogData{WALStart: pq.LSN(13)}, buf, streamBuf)
+	stream.dispatchMessage(&format.LogicalMessage{Transactional: true}, XLogData{WALStart: pq.LSN(12)}, buf, streamBuf)
+	stream.dispatchMessage(&format.Update{TableName: "books"}, XLogData{WALStart: pq.LSN(13)}, buf, streamBuf)
+	stream.dispatchMessage(&format.Commit{TransactionEndLSN: pq.LSN(20)}, XLogData{WALStart: pq.LSN(14)}, buf, streamBuf)
 
-	requireMessageCount(t, out, 4)
+	requireMessageCount(t, out, 5)
 	assertMessage[*format.Begin](t, <-out, pq.LSN(10), pq.LSN(10))
 	assertMessage[*format.Insert](t, <-out, pq.LSN(11), pq.LSN(11))
-	assertMessage[*format.Update](t, <-out, pq.LSN(12), pq.LSN(20))
-	assertMessage[*format.Commit](t, <-out, pq.LSN(13), pq.LSN(20))
+	assertMessage[*format.LogicalMessage](t, <-out, pq.LSN(12), pq.LSN(12))
+	assertMessage[*format.Update](t, <-out, pq.LSN(13), pq.LSN(20))
+	assertMessage[*format.Commit](t, <-out, pq.LSN(14), pq.LSN(20))
 }
 
-func TestDispatchCanEmitStreamCommitBoundary(t *testing.T) {
+func TestDispatchNormalizesStreamedTransactionBoundaries(t *testing.T) {
 	cfg := config.Config{Listener: config.ListenerConfig{EmitTransactionBoundaries: true}}
-	stream := NewStream("", cfg, metric.NewMetric("test_slot"), func(*ListenerContext) {}).(*stream)
+	stream := NewStream("", cfg, nil, metric.NewMetric("test_slot"), func(*ListenerContext) {}).(*stream)
 	out := make(chan *Message, 8)
 	buf := &messageBuffer{outCh: out}
 	streamBuf := &streamTxBuffer{}
@@ -68,16 +70,100 @@ func TestDispatchCanEmitStreamCommitBoundary(t *testing.T) {
 	stream.dispatchMessage(&format.StreamStart{Xid: 7}, XLogData{WALStart: pq.LSN(30)}, buf, streamBuf)
 	stream.dispatchMessage(&format.Insert{TableName: "books"}, XLogData{WALStart: pq.LSN(31)}, buf, streamBuf)
 	stream.dispatchMessage(&format.StreamStop{}, XLogData{WALStart: pq.LSN(32)}, buf, streamBuf)
-	stream.dispatchMessage(&format.StreamCommit{Xid: 7, TransactionEndLSN: pq.LSN(40)}, XLogData{WALStart: pq.LSN(33)}, buf, streamBuf)
+	stream.dispatchMessage(&format.StreamCommit{Xid: 7, CommitLSN: pq.LSN(39), TransactionEndLSN: pq.LSN(40)}, XLogData{WALStart: pq.LSN(33)}, buf, streamBuf)
+
+	requireMessageCount(t, out, 3)
+	assertMessage[*format.Begin](t, <-out, pq.LSN(33), pq.LSN(33))
+	assertMessage[*format.Insert](t, <-out, pq.LSN(31), pq.LSN(40))
+	assertMessage[*format.Commit](t, <-out, pq.LSN(33), pq.LSN(40))
+}
+
+func TestDispatchDefersLogicalCheckpointBehindStreamedTransaction(t *testing.T) {
+	cfg := config.Config{Listener: config.ListenerConfig{EmitTransactionBoundaries: true}}
+	stream := NewStream("", cfg, nil, metric.NewMetric("test_slot"), func(*ListenerContext) {}).(*stream)
+	out := make(chan *Message, 8)
+	buf := &messageBuffer{outCh: out}
+	streamBuf := &streamTxBuffer{}
+
+	stream.dispatchMessage(&format.StreamStart{Xid: 7}, XLogData{WALStart: pq.LSN(30)}, buf, streamBuf)
+	stream.dispatchMessage(&format.LogicalMessage{Transactional: false}, XLogData{WALStart: pq.LSN(31)}, buf, streamBuf)
+	requireMessageCount(t, out, 0)
+	stream.dispatchMessage(&format.StreamCommit{Xid: 7, CommitLSN: pq.LSN(39), TransactionEndLSN: pq.LSN(40)}, XLogData{WALStart: pq.LSN(33)}, buf, streamBuf)
+
+	requireMessageCount(t, out, 3)
+	assertMessage[*format.Begin](t, <-out, pq.LSN(33), pq.LSN(33))
+	assertMessage[*format.Commit](t, <-out, pq.LSN(33), pq.LSN(40))
+	logical := <-out
+	if _, ok := logical.message.(*format.LogicalMessage); !ok || !logical.autoAck {
+		t.Fatalf("logical checkpoint = %#v, want deferred auto-ack", logical)
+	}
+}
+
+func TestDispatchDiscardsTransactionalLogicalMessageOnStreamAbort(t *testing.T) {
+	stream := NewStream("", config.Config{}, nil, metric.NewMetric("test_slot"), func(*ListenerContext) {}).(*stream)
+	out := make(chan *Message, 1)
+	buf := &messageBuffer{outCh: out}
+	streamBuf := &streamTxBuffer{}
+
+	stream.dispatchMessage(&format.StreamStart{Xid: 7}, XLogData{WALStart: pq.LSN(30)}, buf, streamBuf)
+	stream.dispatchMessage(&format.LogicalMessage{Transactional: true}, XLogData{WALStart: pq.LSN(31)}, buf, streamBuf)
+	stream.dispatchMessage(&format.StreamAbort{Xid: 7, SubXid: 7}, XLogData{WALStart: pq.LSN(32)}, buf, streamBuf)
+
+	requireMessageCount(t, out, 0)
+}
+
+func TestDispatchStreamAbortPreservesParentTransactionChanges(t *testing.T) {
+	stream := NewStream("", config.Config{}, nil, metric.NewMetric("test_slot"), func(*ListenerContext) {}).(*stream)
+	out := make(chan *Message, 4)
+	buf := &messageBuffer{outCh: out}
+	streamBuf := &streamTxBuffer{}
+
+	stream.dispatchMessage(&format.StreamStart{Xid: 7}, XLogData{WALStart: pq.LSN(30)}, buf, streamBuf)
+	stream.dispatchMessage(&format.Insert{TableName: "before", XID: 7}, XLogData{WALStart: pq.LSN(31)}, buf, streamBuf)
+	stream.dispatchMessage(&format.Insert{TableName: "aborted", XID: 8}, XLogData{WALStart: pq.LSN(32)}, buf, streamBuf)
+	stream.dispatchMessage(&format.Insert{TableName: "nested", XID: 9}, XLogData{WALStart: pq.LSN(33)}, buf, streamBuf)
+	stream.dispatchMessage(&format.StreamStop{}, XLogData{WALStart: pq.LSN(34)}, buf, streamBuf)
+	stream.dispatchMessage(&format.StreamAbort{Xid: 7, SubXid: 8}, XLogData{WALStart: pq.LSN(35)}, buf, streamBuf)
+	stream.dispatchMessage(&format.StreamStart{Xid: 7}, XLogData{WALStart: pq.LSN(36)}, buf, streamBuf)
+	stream.dispatchMessage(&format.Insert{TableName: "after", XID: 7}, XLogData{WALStart: pq.LSN(37)}, buf, streamBuf)
+	stream.dispatchMessage(&format.StreamStop{}, XLogData{WALStart: pq.LSN(38)}, buf, streamBuf)
+	stream.dispatchMessage(&format.StreamCommit{Xid: 7, TransactionEndLSN: pq.LSN(40)}, XLogData{WALStart: pq.LSN(40)}, buf, streamBuf)
 
 	requireMessageCount(t, out, 2)
-	assertMessage[*format.Insert](t, <-out, pq.LSN(31), pq.LSN(40))
-	assertMessage[*format.StreamCommit](t, <-out, pq.LSN(33), pq.LSN(40))
+	for _, name := range []string{"before", "after"} {
+		message := <-out
+		insert, ok := message.message.(*format.Insert)
+		if !ok || insert.TableName != name {
+			t.Fatalf("message = %#v, want insert %s", message.message, name)
+		}
+	}
+}
+
+func TestDispatchScopesStreamedRelationsToTheirTransaction(t *testing.T) {
+	stream := NewStream("", config.Config{}, nil, metric.NewMetric("test_slot"), func(*ListenerContext) {}).(*stream)
+	stream.relation[42] = &format.Relation{OID: 42, Name: "original"}
+	out := make(chan *Message, 2)
+	buf := &messageBuffer{outCh: out}
+	streamBuf := &streamTxBuffer{}
+
+	stream.dispatchMessage(&format.StreamStart{Xid: 7}, XLogData{}, buf, streamBuf)
+	stream.dispatchMessage(&format.Relation{OID: 42, XID: 7, Name: "aborted"}, XLogData{}, buf, streamBuf)
+	stream.dispatchMessage(&format.StreamStop{}, XLogData{}, buf, streamBuf)
+
+	stream.dispatchMessage(&format.StreamStart{Xid: 8}, XLogData{}, buf, streamBuf)
+	stream.dispatchMessage(&format.Relation{OID: 42, XID: 8, Name: "committed"}, XLogData{}, buf, streamBuf)
+	stream.dispatchMessage(&format.StreamStop{}, XLogData{}, buf, streamBuf)
+	stream.dispatchMessage(&format.StreamCommit{Xid: 8}, XLogData{}, buf, streamBuf)
+	stream.dispatchMessage(&format.StreamAbort{Xid: 7, SubXid: 7}, XLogData{}, buf, streamBuf)
+
+	if got := stream.relation[42].Name; got != "committed" {
+		t.Fatalf("committed relation name = %q, want committed", got)
+	}
 }
 
 func TestProcessExposesWALMetadataToListener(t *testing.T) {
 	received := make(chan ListenerContext, 1)
-	stream := NewStream("", config.Config{}, metric.NewMetric("test_slot"), func(ctx *ListenerContext) {
+	stream := NewStream("", config.Config{}, nil, metric.NewMetric("test_slot"), func(ctx *ListenerContext) {
 		received <- ListenerContext{
 			Message:  ctx.Message,
 			WALStart: ctx.WALStart,
@@ -113,7 +199,7 @@ func TestProcessDoesNotDeliverQueuedMessageAfterCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	calls := 0
-	stream := NewStream("", config.Config{}, metric.NewMetric("test_slot"), func(*ListenerContext) {
+	stream := NewStream("", config.Config{}, nil, metric.NewMetric("test_slot"), func(*ListenerContext) {
 		calls++
 	}).(*stream)
 	stream.messageCH <- &Message{message: &format.Insert{TableName: "queued"}}
@@ -130,7 +216,7 @@ func TestProcessDoesNotDeliverQueuedMessageAfterCancellation(t *testing.T) {
 func TestProcessStopsAfterListenerCancelsContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	calls := 0
-	stream := NewStream("", config.Config{}, metric.NewMetric("test_slot"), func(*ListenerContext) {
+	stream := NewStream("", config.Config{}, nil, metric.NewMetric("test_slot"), func(*ListenerContext) {
 		calls++
 		cancel()
 	}).(*stream)
@@ -147,7 +233,7 @@ func TestProcessStopsAfterListenerCancelsContext(t *testing.T) {
 }
 
 func TestDoneBroadcastsStableTerminalError(t *testing.T) {
-	stream := NewStream("", config.Config{}, metric.NewMetric("test_slot"), func(*ListenerContext) {}).(*stream)
+	stream := NewStream("", config.Config{}, nil, metric.NewMetric("test_slot"), func(*ListenerContext) {}).(*stream)
 	wantErr := errors.New("connection lost")
 	stream.finish(wantErr)
 
@@ -164,7 +250,7 @@ func TestDoneBroadcastsStableTerminalError(t *testing.T) {
 }
 
 func TestSinkRejectsEmptyCopyData(t *testing.T) {
-	stream := NewStream("", config.Config{}, metric.NewMetric("test_slot"), func(*ListenerContext) {}).(*stream)
+	stream := NewStream("", config.Config{}, nil, metric.NewMetric("test_slot"), func(*ListenerContext) {}).(*stream)
 	conn := newWriteOnlyConn()
 	conn.receive = &pgproto3.CopyData{}
 	conn.receiveErr = nil
@@ -182,7 +268,7 @@ func TestSinkRejectsEmptyCopyData(t *testing.T) {
 }
 
 func TestSinkReportsReceiveFailure(t *testing.T) {
-	stream := NewStream("", config.Config{}, metric.NewMetric("test_slot"), func(*ListenerContext) {}).(*stream)
+	stream := NewStream("", config.Config{}, nil, metric.NewMetric("test_slot"), func(*ListenerContext) {}).(*stream)
 	stream.conn = newWriteOnlyConn()
 
 	go stream.sink(context.Background())
@@ -198,7 +284,7 @@ func TestSinkReportsReceiveFailure(t *testing.T) {
 
 func TestProcessDefaultAckAdvancesConfirmedLSN(t *testing.T) {
 	var ackErr error
-	stream := NewStream("", config.Config{}, metric.NewMetric("test_slot"), func(ctx *ListenerContext) {
+	stream := NewStream("", config.Config{}, nil, metric.NewMetric("test_slot"), func(ctx *ListenerContext) {
 		ackErr = ctx.Ack()
 	}).(*stream)
 	stream.messageCH <- &Message{
@@ -223,17 +309,17 @@ func TestProcessTransactionAwareAckAdvancesOnlyOrderedCommits(t *testing.T) {
 	cfg := config.Config{Listener: config.ListenerConfig{EmitTransactionBoundaries: true}}
 	commitAcks := make([]func() error, 0, 2)
 	var rowAckErr error
-	stream := NewStream("", cfg, metric.NewMetric("test_slot"), func(ctx *ListenerContext) {
+	stream := NewStream("", cfg, nil, metric.NewMetric("test_slot"), func(ctx *ListenerContext) {
 		switch ctx.Message.(type) {
 		case *format.Insert:
 			rowAckErr = ctx.Ack()
-		case *format.Commit, *format.StreamCommit:
+		case *format.Commit:
 			commitAcks = append(commitAcks, ctx.Ack)
 		}
 	}).(*stream)
 	stream.messageCH <- &Message{message: &format.Insert{TableName: "books"}, walStart: pq.LSN(9), ackLSN: pq.LSN(10)}
 	stream.messageCH <- &Message{message: &format.Commit{TransactionEndLSN: pq.LSN(10)}, walStart: pq.LSN(10), ackLSN: pq.LSN(10)}
-	stream.messageCH <- &Message{message: &format.StreamCommit{Xid: 7, TransactionEndLSN: pq.LSN(20)}, walStart: pq.LSN(20), ackLSN: pq.LSN(20)}
+	stream.messageCH <- &Message{message: &format.Commit{TransactionEndLSN: pq.LSN(20)}, walStart: pq.LSN(20), ackLSN: pq.LSN(20)}
 	close(stream.messageCH)
 
 	go stream.process(context.Background())
@@ -311,3 +397,35 @@ func (c *writeOnlyConn) Frontend() *pgproto3.Frontend {
 	return pgproto3.NewFrontend(bytes.NewReader(nil), c.out)
 }
 func (c *writeOnlyConn) Exec(context.Context, string) *pgconn.MultiResultReader { return nil }
+
+func TestWaitRequiresListenerQuiescence(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	stream := NewStream("", config.Config{}, nil, metric.NewMetric("test_slot"), func(*ListenerContext) {
+		close(entered)
+		<-release
+	}).(*stream)
+	stream.processStarted.Store(true)
+	stream.messageCH <- &Message{message: &format.Insert{TableName: "books"}}
+	close(stream.messageCH)
+	go stream.process(context.Background())
+
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("listener did not start")
+	}
+
+	waitCtx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	if err := stream.Wait(waitCtx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Wait() error = %v, want deadline exceeded", err)
+	}
+
+	close(release)
+	waitCtx, cancel = context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := stream.Wait(waitCtx); err != nil {
+		t.Fatalf("Wait() after listener release: %v", err)
+	}
+}

@@ -32,8 +32,8 @@ Step 2: Run the connector with heartbeat enabled
 
 	go run .
 
-The connector will automatically create the heartbeat table and start
-updating it at 100ms intervals (default).
+The example database provisions the heartbeat table before startup. The
+connector validates it and starts updating it at 100ms intervals (default).
 
 Step 3: Generate WAL in high_db (different database)
 ----------------------------------------------------

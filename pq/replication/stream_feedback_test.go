@@ -66,7 +66,7 @@ func TestAcknowledgementFlushesDuringContinuousWALTraffic(t *testing.T) {
 	conn.keepalive[0] = message.PrimaryKeepaliveMessageByteID
 	conn.fe = pgproto3.NewFrontend(strings.NewReader(""), feedbackProbeWriter{conn})
 
-	stream := NewStream("", config.Config{}, metric.NewMetric("test_slot"), func(*ListenerContext) {}).(*stream)
+	stream := NewStream("", config.Config{}, nil, metric.NewMetric("test_slot"), func(*ListenerContext) {}).(*stream)
 	stream.conn = conn
 	stream.UpdateXLogPos(200)
 
@@ -102,7 +102,7 @@ func TestCloseSkipsFinalFeedbackWhileSinkIsRunning(t *testing.T) {
 	conn := &feedbackProbeConn{written: written}
 	conn.fe = pgproto3.NewFrontend(strings.NewReader(""), feedbackProbeWriter{conn})
 
-	stream := NewStream("", config.Config{}, metric.NewMetric("test_slot"), func(*ListenerContext) {}).(*stream)
+	stream := NewStream("", config.Config{}, nil, metric.NewMetric("test_slot"), func(*ListenerContext) {}).(*stream)
 	stream.conn = conn
 	stream.sinkStarted.Store(true)
 	stream.UpdateConfirmedXLogPos(100)

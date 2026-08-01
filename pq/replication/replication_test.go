@@ -55,21 +55,24 @@ func TestStartReplicationRequestsOnlySupportedProtocolFeatures(t *testing.T) {
 	for _, test := range []struct {
 		name          string
 		protoVersion  int
+		messages      bool
 		wantStreaming bool
 	}{
 		{name: "protocol 1", protoVersion: 1},
+		{name: "protocol 1 with messages", protoVersion: 1, messages: true},
 		{name: "protocol 2", protoVersion: 2, wantStreaming: true},
+		{name: "protocol 2 with messages", protoVersion: 2, messages: true, wantStreaming: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			conn := newReplicationStartConn()
-			err := New(conn).Start("books_pub", "books_slot", pq.LSN(16), test.protoVersion)
+			err := New(conn).Start("books_pub", "books_slot", pq.LSN(16), test.protoVersion, test.messages)
 			if err != nil {
 				t.Fatalf("Start() error = %v", err)
 			}
 
 			query := conn.out.String()
-			if strings.Contains(query, "messages 'true'") {
-				t.Fatal("START_REPLICATION requested unsupported logical messages")
+			if got := strings.Contains(query, "messages 'true'"); got != test.messages {
+				t.Fatalf("messages option present = %v, want %v; query bytes = %q", got, test.messages, query)
 			}
 			if got := strings.Contains(query, "streaming 'true'"); got != test.wantStreaming {
 				t.Fatalf("streaming option present = %v, want %v; query bytes = %q", got, test.wantStreaming, query)

@@ -33,8 +33,6 @@ func (s *testStream) Done() <-chan struct{}                   { return s.done }
 func (s *testStream) Err() error                              { return s.err }
 func (s *testStream) GetSystemInfo() *pq.IdentifySystemResult { return nil }
 func (s *testStream) GetMetric() metric.Metric                { return nil }
-func (s *testStream) OpenFromSnapshotLSN()                    {}
-func (s *testStream) OpenFromSnapshotLSNAt(pq.LSN)            {}
 func (s *testStream) UpdateXLogPos(pq.LSN)                    {}
 
 func newTestConnector() (*connector, *testServer) {
@@ -76,8 +74,14 @@ func TestStartCancellationCleansUpWithoutStartingServer(t *testing.T) {
 func TestCloseCancelsRunContext(t *testing.T) {
 	connector, _ := newTestConnector()
 	ctx, cancel := context.WithCancelCause(context.Background())
+	done := make(chan struct{})
+	go func() {
+		<-ctx.Done()
+		close(done)
+	}()
 	connector.runMu.Lock()
 	connector.runCancel = cancel
+	connector.runDone = done
 	connector.runMu.Unlock()
 
 	connector.Close()

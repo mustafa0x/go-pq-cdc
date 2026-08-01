@@ -1,696 +1,169 @@
 package config
 
 import (
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/Trendyol/go-pq-cdc/pq/publication"
 	"github.com/Trendyol/go-pq-cdc/pq/slot"
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
 
-func TestGetSnapshotTables(t *testing.T) {
-	t.Run("should preserve SnapshotPartitionStrategy from snapshot.tables when publication exists", func(t *testing.T) {
-		cfg := Config{
-			Snapshot: SnapshotConfig{
-				Enabled: true,
-				Mode:    SnapshotModeInitial,
-				Tables: publication.Tables{
-					{
-						Name:                      "events",
-						Schema:                    "public",
-						SnapshotPartitionStrategy: publication.SnapshotPartitionStrategyCTIDBlock,
-					},
-				},
+func validConfig() Config {
+	return Config{
+		Host:     "localhost",
+		Username: "user",
+		Password: "pass",
+		Database: "db",
+		Publication: publication.Config{
+			Name:              "pub",
+			CreateIfNotExists: true,
+			Operations: publication.Operations{
+				publication.OperationInsert,
+				publication.OperationUpdate,
+				publication.OperationDelete,
 			},
-		}
-		pubInfo := &publication.Config{
-			Tables: publication.Tables{
-				{Name: "events", Schema: "public", SnapshotPartitionStrategy: ""},
-			},
-		}
-
-		tables, err := cfg.GetSnapshotTables(pubInfo)
-
-		require.NoError(t, err)
-		require.Len(t, tables, 1)
-		assert.Equal(t, publication.SnapshotPartitionStrategyCTIDBlock, tables[0].SnapshotPartitionStrategy)
-	})
-
-	t.Run("should preserve SnapshotPartitionStrategy from publication.tables when snapshot.tables is empty", func(t *testing.T) {
-		cfg := Config{
-			Publication: publication.Config{
-				Tables: publication.Tables{
-					{
-						Name:                      "orders",
-						Schema:                    "public",
-						SnapshotPartitionStrategy: publication.SnapshotPartitionStrategyIntegerRange,
-					},
-				},
-			},
-			Snapshot: SnapshotConfig{
-				Enabled: true,
-				Mode:    SnapshotModeInitial,
-				Tables:  nil,
-			},
-		}
-		pubInfo := &publication.Config{
-			Tables: publication.Tables{
-				{Name: "orders", Schema: "public", SnapshotPartitionStrategy: ""},
-			},
-		}
-
-		tables, err := cfg.GetSnapshotTables(pubInfo)
-
-		require.NoError(t, err)
-		require.Len(t, tables, 1)
-		assert.Equal(t, publication.SnapshotPartitionStrategyIntegerRange, tables[0].SnapshotPartitionStrategy)
-	})
-
-	t.Run("should prioritize snapshot.tables strategy over publication.tables strategy", func(t *testing.T) {
-		cfg := Config{
-			Publication: publication.Config{
-				Tables: publication.Tables{
-					{
-						Name:                      "events",
-						Schema:                    "public",
-						SnapshotPartitionStrategy: publication.SnapshotPartitionStrategyIntegerRange,
-					},
-				},
-			},
-			Snapshot: SnapshotConfig{
-				Enabled: true,
-				Mode:    SnapshotModeInitial,
-				Tables: publication.Tables{
-					{
-						Name:                      "events",
-						Schema:                    "public",
-						SnapshotPartitionStrategy: publication.SnapshotPartitionStrategyCTIDBlock,
-					},
-				},
-			},
-		}
-		pubInfo := &publication.Config{
-			Tables: publication.Tables{
-				{Name: "events", Schema: "public", SnapshotPartitionStrategy: ""},
-			},
-		}
-
-		tables, err := cfg.GetSnapshotTables(pubInfo)
-
-		require.NoError(t, err)
-		require.Len(t, tables, 1)
-		assert.Equal(t, publication.SnapshotPartitionStrategyCTIDBlock, tables[0].SnapshotPartitionStrategy)
-	})
-
-	t.Run("should use auto-detect when no strategy specified in config", func(t *testing.T) {
-		cfg := Config{
-			Snapshot: SnapshotConfig{
-				Enabled: true,
-				Mode:    SnapshotModeInitial,
-				Tables:  nil,
-			},
-		}
-		pubInfo := &publication.Config{
-			Tables: publication.Tables{
-				{Name: "users", Schema: "public", SnapshotPartitionStrategy: ""},
-			},
-		}
-
-		tables, err := cfg.GetSnapshotTables(pubInfo)
-
-		require.NoError(t, err)
-		require.Len(t, tables, 1)
-		assert.Equal(t, publication.SnapshotPartitionStrategyAuto, tables[0].SnapshotPartitionStrategy)
-	})
-
-	t.Run("should return error when snapshot.tables contains table not in publication", func(t *testing.T) {
-		cfg := Config{
-			Publication: publication.Config{Name: "test_pub"},
-			Snapshot: SnapshotConfig{
-				Enabled: true,
-				Mode:    SnapshotModeInitial,
-				Tables: publication.Tables{
-					{Name: "non_existent", Schema: "public"},
-				},
-			},
-		}
-		pubInfo := &publication.Config{
-			Tables: publication.Tables{
-				{Name: "events", Schema: "public"},
-			},
-		}
-
-		_, err := cfg.GetSnapshotTables(pubInfo)
-
-		require.Error(t, err)
-		assert.Contains(t, err.Error(), "snapshot table 'public.non_existent' not found in publication")
-	})
-
-	t.Run("should return snapshot.tables directly for snapshot_only mode", func(t *testing.T) {
-		cfg := Config{
-			Snapshot: SnapshotConfig{
-				Enabled: true,
-				Mode:    SnapshotModeSnapshotOnly,
-				Tables: publication.Tables{
-					{
-						Name:                      "events",
-						Schema:                    "public",
-						SnapshotPartitionStrategy: publication.SnapshotPartitionStrategyCTIDBlock,
-					},
-				},
-			},
-		}
-
-		tables, err := cfg.GetSnapshotTables(nil)
-
-		require.NoError(t, err)
-		require.Len(t, tables, 1)
-		assert.Equal(t, "events", tables[0].Name)
-		assert.Equal(t, publication.SnapshotPartitionStrategyCTIDBlock, tables[0].SnapshotPartitionStrategy)
-	})
-
-	t.Run("should return error for snapshot_only mode when tables not specified", func(t *testing.T) {
-		cfg := Config{
-			Snapshot: SnapshotConfig{
-				Enabled: true,
-				Mode:    SnapshotModeSnapshotOnly,
-				Tables:  nil,
-			},
-		}
-
-		_, err := cfg.GetSnapshotTables(nil)
-
-		require.Error(t, err)
-		assert.Contains(t, err.Error(), "snapshot.tables must be specified for snapshot_only mode")
-	})
+			Tables: publication.Tables{{
+				Name:            "events",
+				Schema:          "public",
+				ReplicaIdentity: publication.ReplicaIdentityDefault,
+			}},
+		},
+		Slot: slot.Config{
+			Name:                        "slot",
+			CreateIfNotExists:           true,
+			SlotActivityCheckerInterval: time.Second,
+		},
+	}
 }
 
-func TestMergePublicationTableConfig(t *testing.T) {
-	t.Run("should merge strategy from publication config", func(t *testing.T) {
-		cfg := Config{
-			Publication: publication.Config{
-				Tables: publication.Tables{
-					{
-						Name:                      "events",
-						Schema:                    "public",
-						SnapshotPartitionStrategy: publication.SnapshotPartitionStrategyCTIDBlock,
-					},
-					{
-						Name:                      "orders",
-						Schema:                    "public",
-						SnapshotPartitionStrategy: publication.SnapshotPartitionStrategyOffset,
-					},
-				},
-			},
-		}
-		pubInfoTables := publication.Tables{
-			{Name: "events", Schema: "public", SnapshotPartitionStrategy: ""},
-			{Name: "orders", Schema: "public", SnapshotPartitionStrategy: ""},
-			{Name: "users", Schema: "public", SnapshotPartitionStrategy: ""},
-		}
+func TestSetDefaultOwnsRuntimeDefaults(t *testing.T) {
+	cfg := validConfig()
+	cfg.Port = 0
+	cfg.Metric.Port = 0
+	cfg.Publication.Tables[0].Schema = ""
+	cfg.Slot.ProtoVersion = 0
+	cfg.Slot.SlotActivityCheckerInterval = 0
 
-		result := cfg.mergePublicationTableConfig(pubInfoTables)
+	cfg.SetDefault()
 
-		require.Len(t, result, 3)
-		assert.Equal(t, publication.SnapshotPartitionStrategyCTIDBlock, result[0].SnapshotPartitionStrategy)
-		assert.Equal(t, publication.SnapshotPartitionStrategyOffset, result[1].SnapshotPartitionStrategy)
-		assert.Equal(t, publication.SnapshotPartitionStrategyAuto, result[2].SnapshotPartitionStrategy)
-	})
-
-	t.Run("should return original tables when publication config is empty", func(t *testing.T) {
-		cfg := Config{
-			Publication: publication.Config{Tables: nil},
-		}
-		pubInfoTables := publication.Tables{
-			{Name: "events", Schema: "public"},
-		}
-
-		result := cfg.mergePublicationTableConfig(pubInfoTables)
-
-		assert.Equal(t, pubInfoTables, result)
-	})
-
-	t.Run("should preserve other table properties while merging strategy", func(t *testing.T) {
-		cfg := Config{
-			Publication: publication.Config{
-				Tables: publication.Tables{
-					{
-						Name:                      "events",
-						Schema:                    "public",
-						SnapshotPartitionStrategy: publication.SnapshotPartitionStrategyCTIDBlock,
-					},
-				},
-			},
-		}
-		pubInfoTables := publication.Tables{
-			{Name: "events", Schema: "public", ReplicaIdentity: "full", SnapshotPartitionStrategy: ""},
-		}
-
-		result := cfg.mergePublicationTableConfig(pubInfoTables)
-
-		require.Len(t, result, 1)
-		assert.Equal(t, "events", result[0].Name)
-		assert.Equal(t, "public", result[0].Schema)
-		assert.Equal(t, "full", result[0].ReplicaIdentity)
-		assert.Equal(t, publication.SnapshotPartitionStrategyCTIDBlock, result[0].SnapshotPartitionStrategy)
-	})
+	if cfg.Port != 5432 || cfg.Metric.Port != 8080 {
+		t.Fatalf("ports = %d/%d", cfg.Port, cfg.Metric.Port)
+	}
+	if cfg.Publication.Tables[0].Schema != "public" {
+		t.Fatalf("table schema = %q", cfg.Publication.Tables[0].Schema)
+	}
+	if cfg.Slot.ProtoVersion != 2 || cfg.Slot.SlotActivityCheckerInterval != time.Second {
+		t.Fatalf("slot defaults = proto %d interval %s", cfg.Slot.ProtoVersion, cfg.Slot.SlotActivityCheckerInterval)
+	}
 }
 
-func TestSnapshotConfigID(t *testing.T) {
-	t.Run("should store custom ID", func(t *testing.T) {
-		cfg := SnapshotConfig{
-			Enabled: true,
-			Mode:    SnapshotModeSnapshotOnly,
-			ID:      "my_custom_snapshot",
-			Tables: publication.Tables{
-				{Name: "events", Schema: "public"},
-			},
-		}
+func TestSetDefaultOwnsPublicationInput(t *testing.T) {
+	columns := []string{"id", "name"}
+	tables := publication.Tables{{
+		Name:            "events",
+		Columns:         columns,
+		ReplicaIdentity: publication.ReplicaIdentityDefault,
+	}}
+	operations := publication.Operations{publication.OperationInsert}
+	cfg := validConfig()
+	cfg.Publication.Tables = tables
+	cfg.Publication.Operations = operations
 
-		assert.Equal(t, "my_custom_snapshot", cfg.ID)
-	})
+	cfg.SetDefault()
+	cfg.Publication.Tables[0].Columns[0] = "changed"
+	cfg.Publication.Operations[0] = publication.OperationDelete
 
-	t.Run("should allow empty ID for default behavior", func(t *testing.T) {
-		cfg := SnapshotConfig{
-			Enabled: true,
-			Mode:    SnapshotModeSnapshotOnly,
-			ID:      "",
-			Tables: publication.Tables{
-				{Name: "events", Schema: "public"},
-			},
-		}
-
-		assert.Empty(t, cfg.ID)
-	})
-
-	t.Run("should pass validation with custom ID", func(t *testing.T) {
-		cfg := SnapshotConfig{
-			Enabled:           true,
-			Mode:              SnapshotModeSnapshotOnly,
-			ID:                "custom_snapshot_id",
-			ChunkSize:         1000,
-			ClaimTimeout:      30 * time.Second,
-			HeartbeatInterval: 5 * time.Second,
-			Tables: publication.Tables{
-				{Name: "events", Schema: "public"},
-			},
-		}
-
-		err := cfg.Validate()
-		assert.NoError(t, err)
-	})
-
-	t.Run("should pass validation without custom ID", func(t *testing.T) {
-		cfg := SnapshotConfig{
-			Enabled:           true,
-			Mode:              SnapshotModeSnapshotOnly,
-			ID:                "",
-			ChunkSize:         1000,
-			ClaimTimeout:      30 * time.Second,
-			HeartbeatInterval: 5 * time.Second,
-			Tables: publication.Tables{
-				{Name: "events", Schema: "public"},
-			},
-		}
-
-		err := cfg.Validate()
-		assert.NoError(t, err)
-	})
+	if columns[0] != "id" || tables[0].Schema != "" || tables[0].ColumnsSpecified {
+		t.Fatalf("SetDefault mutated caller-owned tables: %#v", tables)
+	}
+	if operations[0] != publication.OperationInsert {
+		t.Fatalf("SetDefault aliased caller-owned operations: %v", operations)
+	}
 }
 
-func TestSnapshotConfigValidateLeaseTiming(t *testing.T) {
-	base := SnapshotConfig{
-		Enabled:           true,
-		Mode:              SnapshotModeInitial,
-		ChunkSize:         1000,
-		ClaimTimeout:      30 * time.Second,
-		HeartbeatInterval: 5 * time.Second,
+func TestSetDefaultPreservesPublicationColumnIntent(t *testing.T) {
+	cfg := validConfig()
+	cfg.Publication.Tables = publication.Tables{
+		{
+			Name:            "events",
+			Columns:         []string{"id", "name"},
+			ReplicaIdentity: publication.ReplicaIdentityDefault,
+		},
+		{
+			Name:            "event_parts",
+			Partitioned:     true,
+			ReplicaIdentity: publication.ReplicaIdentityDefault,
+		},
 	}
 
-	t.Run("accepts heartbeat at half the claim timeout", func(t *testing.T) {
-		cfg := base
-		cfg.HeartbeatInterval = 15 * time.Second
-		assert.NoError(t, cfg.Validate())
-	})
+	cfg.SetDefault()
 
-	t.Run("rejects heartbeat above half the claim timeout", func(t *testing.T) {
-		cfg := base
-		cfg.HeartbeatInterval = 16 * time.Second
-		err := cfg.Validate()
-		require.Error(t, err)
-		assert.Contains(t, err.Error(), "half the claim timeout")
-	})
-}
-
-func TestSnapshotConfigValidateRequiresResnapshotID(t *testing.T) {
-	cfg := SnapshotConfig{
-		Mode:              SnapshotModeInitial,
-		ChunkSize:         100,
-		ClaimTimeout:      30 * time.Second,
-		HeartbeatInterval: 5 * time.Second,
-		Enabled:           true,
-		Resnapshot:        true,
+	if !cfg.Publication.Tables[0].ColumnsSpecified {
+		t.Fatal("configured column list was not marked explicit")
 	}
-
-	require.EqualError(t, cfg.Validate(), "snapshot.resnapshotId is required when resnapshot is enabled")
-	cfg.ResnapshotID = "rebuild-2026-07-18"
-	require.NoError(t, cfg.Validate())
-}
-
-func TestValidateSnapshotSubset(t *testing.T) {
-	t.Run("should preserve SnapshotPartitionStrategy from snapshot config", func(t *testing.T) {
-		cfg := Config{
-			Snapshot: SnapshotConfig{
-				Tables: publication.Tables{
-					{
-						Name:                      "events",
-						Schema:                    "public",
-						SnapshotPartitionStrategy: publication.SnapshotPartitionStrategyCTIDBlock,
-					},
-				},
-			},
-		}
-		pubTables := publication.Tables{
-			{Name: "events", Schema: "public", ReplicaIdentity: "full", SnapshotPartitionStrategy: ""},
-		}
-
-		result, err := cfg.validateSnapshotSubset(pubTables)
-
-		require.NoError(t, err)
-		require.Len(t, result, 1)
-		assert.Equal(t, "events", result[0].Name)
-		assert.Equal(t, "full", result[0].ReplicaIdentity)
-		assert.Equal(t, publication.SnapshotPartitionStrategyCTIDBlock, result[0].SnapshotPartitionStrategy)
-	})
-
-	t.Run("should return error when publication tables are empty", func(t *testing.T) {
-		cfg := Config{
-			Snapshot: SnapshotConfig{
-				Tables: publication.Tables{
-					{Name: "events", Schema: "public"},
-				},
-			},
-		}
-
-		_, err := cfg.validateSnapshotSubset(publication.Tables{})
-
-		require.Error(t, err)
-		assert.Contains(t, err.Error(), "publication has no tables defined")
-	})
-
-	t.Run("should use auto-detect when snapshot table has no strategy specified", func(t *testing.T) {
-		cfg := Config{
-			Snapshot: SnapshotConfig{
-				Tables: publication.Tables{
-					{
-						Name:                      "events",
-						Schema:                    "public",
-						SnapshotPartitionStrategy: "",
-					},
-				},
-			},
-		}
-		pubTables := publication.Tables{
-			{Name: "events", Schema: "public", SnapshotPartitionStrategy: ""},
-		}
-
-		result, err := cfg.validateSnapshotSubset(pubTables)
-
-		require.NoError(t, err)
-		require.Len(t, result, 1)
-		assert.Equal(t, publication.SnapshotPartitionStrategyAuto, result[0].SnapshotPartitionStrategy)
-	})
-
-	t.Run("should validate multiple tables with different strategies", func(t *testing.T) {
-		cfg := Config{
-			Snapshot: SnapshotConfig{
-				Tables: publication.Tables{
-					{
-						Name:                      "events",
-						Schema:                    "public",
-						SnapshotPartitionStrategy: publication.SnapshotPartitionStrategyCTIDBlock,
-					},
-					{
-						Name:                      "orders",
-						Schema:                    "public",
-						SnapshotPartitionStrategy: publication.SnapshotPartitionStrategyIntegerRange,
-					},
-				},
-			},
-		}
-		pubTables := publication.Tables{
-			{Name: "events", Schema: "public"},
-			{Name: "orders", Schema: "public"},
-			{Name: "users", Schema: "public"},
-		}
-
-		result, err := cfg.validateSnapshotSubset(pubTables)
-
-		require.NoError(t, err)
-		require.Len(t, result, 2)
-		assert.Equal(t, publication.SnapshotPartitionStrategyCTIDBlock, result[0].SnapshotPartitionStrategy)
-		assert.Equal(t, publication.SnapshotPartitionStrategyIntegerRange, result[1].SnapshotPartitionStrategy)
-	})
-}
-
-func TestQueryConditionPropagation(t *testing.T) {
-	t.Run("validateSnapshotSubset preserves QueryCondition from snapshot.tables", func(t *testing.T) {
-		cfg := Config{
-			Snapshot: SnapshotConfig{
-				Tables: publication.Tables{
-					{
-						Name:           "events",
-						Schema:         "public",
-						QueryCondition: "created_at > '2024-01-01'",
-					},
-				},
-			},
-		}
-		pubTables := publication.Tables{
-			{Name: "events", Schema: "public", ReplicaIdentity: "full"},
-		}
-
-		result, err := cfg.validateSnapshotSubset(pubTables)
-
-		require.NoError(t, err)
-		require.Len(t, result, 1)
-		assert.Equal(t, "created_at > '2024-01-01'", result[0].QueryCondition)
-		assert.Equal(t, "full", result[0].ReplicaIdentity)
-	})
-
-	t.Run("mergePublicationTableConfig preserves QueryCondition from publication.tables", func(t *testing.T) {
-		cfg := Config{
-			Publication: publication.Config{
-				Tables: publication.Tables{
-					{
-						Name:           "events",
-						Schema:         "public",
-						QueryCondition: "is_active = true",
-					},
-					{
-						Name:           "orders",
-						Schema:         "public",
-						QueryCondition: "status != 'cancelled'",
-					},
-				},
-			},
-		}
-		pubInfoTables := publication.Tables{
-			{Name: "events", Schema: "public"},
-			{Name: "orders", Schema: "public"},
-			{Name: "users", Schema: "public"},
-		}
-
-		result := cfg.mergePublicationTableConfig(pubInfoTables)
-
-		require.Len(t, result, 3)
-		assert.Equal(t, "is_active = true", result[0].QueryCondition)
-		assert.Equal(t, "status != 'cancelled'", result[1].QueryCondition)
-		assert.Empty(t, result[2].QueryCondition, "table without user config keeps empty QueryCondition")
-	})
-
-	t.Run("GetSnapshotTables end-to-end: per-table QueryCondition reaches snapshotter through publication.tables", func(t *testing.T) {
-		cfg := Config{
-			Publication: publication.Config{
-				Tables: publication.Tables{
-					{Name: "users", Schema: "public", QueryCondition: "deleted_at IS NULL"},
-				},
-			},
-			Snapshot: SnapshotConfig{
-				Enabled:        true,
-				Mode:           SnapshotModeInitial,
-				QueryCondition: "created_at >= '2024-01-01'",
-			},
-		}
-		pubInfo := &publication.Config{
-			Tables: publication.Tables{
-				{Name: "users", Schema: "public"},
-			},
-		}
-
-		tables, err := cfg.GetSnapshotTables(pubInfo)
-
-		require.NoError(t, err)
-		require.Len(t, tables, 1)
-		assert.Equal(t, "deleted_at IS NULL", tables[0].QueryCondition,
-			"per-table QueryCondition from publication.tables must be propagated so per-table override works")
-	})
-
-	t.Run("GetSnapshotTables end-to-end: per-table QueryCondition reaches snapshotter through snapshot.tables", func(t *testing.T) {
-		cfg := Config{
-			Snapshot: SnapshotConfig{
-				Enabled: true,
-				Mode:    SnapshotModeInitial,
-				Tables: publication.Tables{
-					{Name: "users", Schema: "public", QueryCondition: "deleted_at IS NULL"},
-				},
-			},
-		}
-		pubInfo := &publication.Config{
-			Tables: publication.Tables{
-				{Name: "users", Schema: "public", ReplicaIdentity: "full"},
-			},
-		}
-
-		tables, err := cfg.GetSnapshotTables(pubInfo)
-
-		require.NoError(t, err)
-		require.Len(t, tables, 1)
-		assert.Equal(t, "deleted_at IS NULL", tables[0].QueryCondition)
-		assert.Equal(t, "full", tables[0].ReplicaIdentity, "publication metadata is still merged in")
-	})
-}
-
-func TestSnapshotConfigValidateRejectsUnknownPartitionStrategy(t *testing.T) {
-	cfg := SnapshotConfig{
-		Enabled:           true,
-		Mode:              SnapshotModeSnapshotOnly,
-		ChunkSize:         100,
-		ClaimTimeout:      30 * time.Second,
-		HeartbeatInterval: 5 * time.Second,
-		Tables: publication.Tables{{
-			Name:                      "events",
-			Schema:                    "public",
-			SnapshotPartitionStrategy: publication.SnapshotPartitionStrategy("mystery"),
-		}},
+	if cfg.Publication.Tables[1].ColumnsSpecified {
+		t.Fatal("unrestricted table was marked explicit")
 	}
-
-	err := cfg.Validate()
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "undefined snapshot partition strategy")
-}
-
-func TestSnapshotConfigValidateQueryCondition(t *testing.T) {
-	base := SnapshotConfig{
-		Enabled:           true,
-		Mode:              SnapshotModeInitial,
-		ChunkSize:         1000,
-		ClaimTimeout:      30 * time.Second,
-		HeartbeatInterval: 5 * time.Second,
+	if !cfg.Publication.PublishViaPartitionRoot {
+		t.Fatal("partition-root publication intent was not normalized")
 	}
-
-	t.Run("rejects unsafe global queryCondition", func(t *testing.T) {
-		cfg := base
-		cfg.QueryCondition = "true; SELECT 1"
-		err := cfg.Validate()
-		require.Error(t, err)
-		assert.Contains(t, err.Error(), `";"`)
-	})
-
-	t.Run("rejects unsafe per-table queryCondition in snapshot.tables", func(t *testing.T) {
-		cfg := base
-		cfg.Tables = publication.Tables{
-			{Name: "t", Schema: "public", ReplicaIdentity: publication.ReplicaIdentityFull, QueryCondition: "x /* */"},
-		}
-		err := cfg.Validate()
-		require.Error(t, err)
-		assert.Contains(t, err.Error(), "snapshot.tables")
-		assert.Contains(t, err.Error(), `"/*"`)
-	})
 }
 
 func TestValidateHeartbeatInPublication(t *testing.T) {
-	validBase := func() Config {
-		return Config{
-			Host:     "localhost",
-			Username: "user",
-			Password: "pass",
-			Database: "db",
-			Slot: slot.Config{
-				Name:                        "slot",
-				CreateIfNotExists:           true,
-				SlotActivityCheckerInterval: 1000,
-			},
-			Publication: publication.Config{
-				Name:              "pub",
-				CreateIfNotExists: true,
-				Operations:        publication.Operations{publication.OperationInsert},
-			},
-		}
+	cfg := validConfig()
+	cfg.Heartbeat = HeartbeatConfig{
+		Table:    publication.Table{Name: "heartbeat_events", Schema: "public", ReplicaIdentity: publication.ReplicaIdentityDefault},
+		Interval: time.Second,
+	}
+	cfg.Publication.Tables = append(cfg.Publication.Tables, cfg.Heartbeat.Table)
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	withoutUpdate := cfg
+	withoutUpdate.Publication.Operations = publication.Operations{publication.OperationInsert}
+	if err := withoutUpdate.Validate(); err == nil {
+		t.Fatal("heartbeat publication without UPDATE was accepted")
 	}
 
-	t.Run("passes when heartbeat table is in publication.tables", func(t *testing.T) {
-		cfg := validBase()
-		cfg.Heartbeat = HeartbeatConfig{
-			Table:    publication.Table{Name: "heartbeat_events", Schema: "public", ReplicaIdentity: publication.ReplicaIdentityFull},
-			Interval: 100 * time.Millisecond,
-		}
-		cfg.Publication.Tables = publication.Tables{
-			{Name: "users", Schema: "public", ReplicaIdentity: publication.ReplicaIdentityFull},
-			{Name: "heartbeat_events", Schema: "public", ReplicaIdentity: publication.ReplicaIdentityFull},
-		}
+	actual := &publication.Config{Name: "pub", Tables: publication.Tables{{Name: "events", Schema: "public"}}}
+	if err := cfg.ValidateHeartbeatInPublication(actual); err == nil {
+		t.Fatal("missing heartbeat publication relation was accepted")
+	}
+	actual.Tables = append(actual.Tables, publication.Table{Name: "heartbeat_events", Schema: "public"})
+	if err := cfg.ValidateHeartbeatInPublication(actual); err != nil {
+		t.Fatal(err)
+	}
+}
 
-		err := cfg.Validate()
-		require.NoError(t, err)
-	})
-
-	t.Run("fails when heartbeat table is missing from publication.tables", func(t *testing.T) {
-		cfg := validBase()
-		cfg.Heartbeat = HeartbeatConfig{
-			Table:    publication.Table{Name: "heartbeat_events", Schema: "public", ReplicaIdentity: publication.ReplicaIdentityFull},
-			Interval: 100 * time.Millisecond,
-		}
-		cfg.Publication.Tables = publication.Tables{
-			{Name: "users", Schema: "public", ReplicaIdentity: publication.ReplicaIdentityFull},
-		}
-
-		err := cfg.Validate()
-		require.Error(t, err)
-		assert.Contains(t, err.Error(), "heartbeat table public.heartbeat_events is not included in publication")
-	})
-
-	t.Run("skips check for puballtables publications", func(t *testing.T) {
-		cfg := Config{
-			Heartbeat: HeartbeatConfig{
-				Table: publication.Table{Name: "heartbeat_events", Schema: "public"},
-			},
-		}
-		pubInfo := &publication.Config{
-			Name:      "pub",
-			AllTables: true,
-			Tables:    publication.Tables{{Name: "users", Schema: "public"}},
-		}
-
-		require.NoError(t, cfg.ValidateHeartbeatInPublication(pubInfo))
-	})
-
-	t.Run("runtime check uses actual publication info tables", func(t *testing.T) {
-		cfg := Config{
-			Heartbeat: HeartbeatConfig{
-				Table: publication.Table{Name: "heartbeat_events", Schema: "public"},
-			},
-		}
-		pubInfo := &publication.Config{
-			Name: "pub",
-			Tables: publication.Tables{
-				{Name: "users", Schema: "public"},
-			},
-		}
-
-		err := cfg.ValidateHeartbeatInPublication(pubInfo)
-		require.Error(t, err)
-		assert.Contains(t, err.Error(), `publication "pub"`)
-	})
+func TestConfigReadersRejectRemovedConfiguration(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		want string
+	}{
+		{"snapshot.json", `{"snapshot":{"enabled":true}}`, "snapshot"},
+		{"snapshot.yaml", "snapshot:\n  enabled: true\n", "snapshot"},
+		{"timescale.json", `{"extensionSupport":{"enableTimeScaleDB":true}}`, "extensionSupport"},
+		{"timescale.yaml", "extensionSupport:\n  enableTimeScaleDB: true\n", "extensionSupport"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), test.name)
+			if err := os.WriteFile(path, []byte(test.body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			var err error
+			if strings.HasSuffix(test.name, ".json") {
+				_, err = ReadConfigJSON(path)
+			} else {
+				_, err = ReadConfigYAML(path)
+			}
+			if err == nil || !strings.Contains(strings.ToLower(err.Error()), strings.ToLower(test.want)) {
+				t.Fatalf("reader error = %v, want removed field %q", err, test.want)
+			}
+		})
+	}
 }

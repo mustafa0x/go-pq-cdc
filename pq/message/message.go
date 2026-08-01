@@ -54,6 +54,8 @@ func New(data []byte, streamedTransaction bool, serverTime time.Time, relation m
 		return format.NewDelete(data, streamedTransaction, relation, serverTime)
 	case TruncateByte:
 		return format.NewTruncate(data, streamedTransaction, relation, serverTime)
+	case LogicalByte:
+		return format.NewLogicalMessage(data, streamedTransaction)
 	case StreamStartByte:
 		return format.NewStreamStart(data)
 	case StreamStopByte:
@@ -63,11 +65,7 @@ func New(data []byte, streamedTransaction bool, serverTime time.Time, relation m
 	case StreamCommitByte:
 		return format.NewStreamCommit(data)
 	case RelationByte:
-		msg, err := format.NewRelation(data, streamedTransaction)
-		if err == nil {
-			relation[msg.OID] = msg
-		}
-		return msg, err
+		return format.NewRelation(data, streamedTransaction)
 	default:
 		return nil, fmt.Errorf("message type %q: %w", data[0], ErrorByteNotSupported)
 	}

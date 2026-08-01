@@ -45,6 +45,19 @@ func TestTableValidateReplicaIdentityIndex(t *testing.T) {
 	})
 }
 
+func TestTableValidateRejectsRowFilter(t *testing.T) {
+	table := Table{
+		Name:            "books",
+		Schema:          "public",
+		ReplicaIdentity: ReplicaIdentityDefault,
+		RowFilter:       "id > 10",
+	}
+
+	err := table.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "row filters are not supported")
+}
+
 func TestTablesDiffReplicaIdentityIndex(t *testing.T) {
 	current := Tables{
 		{
@@ -110,16 +123,4 @@ func TestTablesContains(t *testing.T) {
 	assert.True(t, tables.Contains("", "users"))
 	assert.True(t, tables.Contains("tenant_a", "events"))
 	assert.False(t, tables.Contains("public", "orders"))
-}
-
-func TestTableValidateRejectsUnknownSnapshotPartitionStrategy(t *testing.T) {
-	table := Table{
-		Name:                      "books",
-		ReplicaIdentity:           ReplicaIdentityDefault,
-		SnapshotPartitionStrategy: SnapshotPartitionStrategy("mystery"),
-	}
-
-	err := table.Validate()
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "undefined snapshot partition strategy")
 }

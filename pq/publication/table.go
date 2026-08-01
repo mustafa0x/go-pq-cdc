@@ -7,40 +7,15 @@ import (
 	"github.com/go-playground/errors"
 )
 
-// SnapshotPartitionStrategy defines how a table should be partitioned during snapshot.
-// If empty, the strategy is auto-detected based on primary key type.
-type SnapshotPartitionStrategy string
-
-const (
-	// SnapshotPartitionStrategyAuto lets the system decide based on PK type (default)
-	SnapshotPartitionStrategyAuto SnapshotPartitionStrategy = ""
-	// SnapshotPartitionStrategyIntegerRange uses MIN/MAX range for integer PKs
-	SnapshotPartitionStrategyIntegerRange SnapshotPartitionStrategy = "integer_range"
-	// SnapshotPartitionStrategyCTIDBlock uses PostgreSQL physical block locations
-	SnapshotPartitionStrategyCTIDBlock SnapshotPartitionStrategy = "ctid_block"
-	// SnapshotPartitionStrategyOffset uses LIMIT/OFFSET (slow, fallback)
-	SnapshotPartitionStrategyOffset SnapshotPartitionStrategy = "offset"
-)
-
-// ValidSnapshotPartitionStrategies contains all valid partition strategy options.
-var ValidSnapshotPartitionStrategies = []SnapshotPartitionStrategy{
-	SnapshotPartitionStrategyAuto,
-	SnapshotPartitionStrategyIntegerRange,
-	SnapshotPartitionStrategyCTIDBlock,
-	SnapshotPartitionStrategyOffset,
-}
-
 type Table struct {
 	Name                 string `json:"name" yaml:"name"`
 	ReplicaIdentity      string `json:"replicaIdentity" yaml:"replicaIdentity"`
 	ReplicaIdentityIndex string `json:"replicaIdentityIndex,omitempty" yaml:"replicaIdentityIndex,omitempty"`
 	Schema               string `json:"schema,omitempty" yaml:"schema,omitempty"`
-	// SnapshotPartitionStrategy allows overriding the auto-detected partition strategy.
-	// Useful when integer PKs are hash-based (not sequential) and range partitioning performs poorly.
-	// Options: "" (auto), "integer_range", "ctid_block", "offset"
-	SnapshotPartitionStrategy SnapshotPartitionStrategy `json:"snapshotPartitionStrategy,omitempty" yaml:"snapshotPartitionStrategy,omitempty"`
-	QueryCondition            string                    `json:"queryCondition,omitempty" yaml:"queryCondition,omitempty"`
-	Columns                   []string                  `json:"columns,omitempty" yaml:"columns,omitempty"`
+	// RowFilter and ColumnsSpecified are populated by publication introspection.
+	RowFilter        string   `json:"-" yaml:"-"`
+	ColumnsSpecified bool     `json:"-" yaml:"-"`
+	Columns          []string `json:"columns,omitempty" yaml:"columns,omitempty"`
 	// Boolean flag to indicate if the table is partitioned, used for creating the publication on the root table.
 	Partitioned bool `json:"partitioned,omitempty" yaml:"partitioned,omitempty"`
 }
@@ -54,8 +29,8 @@ func (tc Table) Validate() error {
 		return errors.Newf("undefined replica identity option. valid identity options are: %v", ReplicaIdentityOptions)
 	}
 
-	if tc.ReplicaIdentity == ReplicaIdentityFull && len(tc.Columns) > 0 {
-		return errors.New("cannot specify columns when replica identity is FULL. Must be ReplicaIdentityDefault")
+	if strings.TrimSpace(tc.RowFilter) != "" {
+		return errors.New("publication row filters are not supported by the static connector contract")
 	}
 
 	if tc.ReplicaIdentity == ReplicaIdentityUsingIndex {
@@ -64,16 +39,6 @@ func (tc Table) Validate() error {
 		}
 	} else if strings.TrimSpace(tc.ReplicaIdentityIndex) != "" {
 		return errors.New("replicaIdentityIndex can only be set when replicaIdentity is USING INDEX")
-	}
-
-	if tc.QueryCondition != "" {
-		if err := ValidateQueryCondition(tc.QueryCondition); err != nil {
-			return errors.Wrap(err, "queryCondition")
-		}
-	}
-
-	if !slices.Contains(ValidSnapshotPartitionStrategies, tc.SnapshotPartitionStrategy) {
-		return errors.Newf("undefined snapshot partition strategy %q", tc.SnapshotPartitionStrategy)
 	}
 
 	return nil
@@ -104,9 +69,31 @@ func (ts Tables) Validate() error {
 		return errors.New("at least one table must be defined")
 	}
 
+	seenTables := make(map[string]struct{}, len(ts))
 	for _, t := range ts {
 		if err := t.Validate(); err != nil {
 			return err
+		}
+		schema := strings.TrimSpace(t.Schema)
+		if schema == "" {
+			schema = defaultTableSchema
+		}
+		key := schema + "." + strings.TrimSpace(t.Name)
+		if _, ok := seenTables[key]; ok {
+			return errors.Newf("duplicate table %s", key)
+		}
+		seenTables[key] = struct{}{}
+
+		seenColumns := make(map[string]struct{}, len(t.Columns))
+		for _, column := range t.Columns {
+			column = strings.TrimSpace(column)
+			if column == "" {
+				return errors.Newf("table %s has an empty column", key)
+			}
+			if _, ok := seenColumns[column]; ok {
+				return errors.Newf("table %s has duplicate column %s", key, column)
+			}
+			seenColumns[column] = struct{}{}
 		}
 	}
 
