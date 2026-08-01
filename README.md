@@ -56,7 +56,7 @@ func main() {
         Slot: slot.Config{
             Name:              "cdc_slot",
             CreateIfNotExists: true,
-            ProtoVersion:      2,
+            ProtoVersion:      1,
         },
     }, listen)
     if err != nil {
@@ -148,7 +148,7 @@ Configuration can be constructed in Go or read from strict JSON/YAML. Unknown fi
 | `publication.tables[].partitioned` | no | `false` | Publish partitioned changes through the root |
 | `slot.name` | yes | — | Logical slot name |
 | `slot.createIfNotExists` | no | `false` | Create the slot when absent |
-| `slot.protoVersion` | no | `2` | `1` or `2` |
+| `slot.protoVersion` | no | `1` | `1` or `2` |
 | `slot.messages` | no | `false` | Request logical messages |
 | `slot.slotActivityCheckerInterval` | no | `1s` | Passive-owner polling interval |
 | `listener.emitTransactionBoundaries` | no | `false` | Emit transaction boundaries |

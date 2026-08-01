@@ -11,8 +11,8 @@ type Config struct {
 	SlotActivityCheckerInterval time.Duration `json:"slotActivityCheckerInterval" yaml:"slotActivityCheckerInterval"`
 	// ProtoVersion selects the pgoutput logical replication protocol version.
 	// Both modes require PostgreSQL 16+ in this fork.
-	//   1 – no streaming transaction support.
-	//   2 – supports streaming large in-progress transactions (default).
+	//   1 – bounded connector memory; PostgreSQL delivers changes after commit (default).
+	//   2 – streams in-progress transactions; this connector buffers each transaction until commit.
 	ProtoVersion      int  `json:"protoVersion" yaml:"protoVersion"`
 	Messages          bool `json:"messages" yaml:"messages"`
 	CreateIfNotExists bool `json:"createIfNotExists" yaml:"createIfNotExists"`

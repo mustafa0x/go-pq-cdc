@@ -65,6 +65,8 @@ type RelationSpec struct {
 	PrimaryKey           string
 }
 
+// Spec requires fixed partition membership for a capture generation when
+// PublishViaPartitionRoot is set. ATTACH or DETACH requires a resnapshot.
 type Spec struct {
 	PublicationName         string
 	Relations               []RelationSpec

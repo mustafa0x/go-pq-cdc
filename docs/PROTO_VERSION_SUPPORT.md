@@ -7,7 +7,7 @@ This document explains the changes introduced on `feature/protoversion1-support`
 Main improvements:
 
 - Added configurable `slot.protoVersion` (`1` or `2`)
-- Defaulted protocol version to `2` when not set
+- Defaulted protocol version to `1` when not set
 - Updated replication startup arguments according to protocol version
 - Added full decoding for `STREAM START` and `STREAM ABORT` payloads
 - Fixed streamed transaction buffering so rolled-back streamed data is never emitted
@@ -19,8 +19,8 @@ Main improvements:
 
 `slot.Config` now includes:
 
-- `protoVersion: 1` for compatibility mode
-- `protoVersion: 2` for streaming-aware mode (default)
+- `protoVersion: 1` for bounded-memory commit delivery (default)
+- `protoVersion: 2` for streaming-aware mode
 
 Validation now rejects unsupported values.
 
@@ -54,19 +54,20 @@ The stream sink now buffers messages per transaction XID and applies this policy
 - On `STREAM ABORT`: discard buffered data for XID
 
 Result: rolled-back streamed transactions are never delivered to handlers.
+The connector retains every streamed message until commit, so memory use grows with all open streamed transactions.
 
 ## Choosing `protoVersion`
 
 ### Use `protoVersion: 1` when:
 
-- You do not want streamed transaction protocol messages
-- You do not require streamed in-progress transaction handling
+- You need bounded connector memory for arbitrarily large transactions
+- You accept PostgreSQL delivering changes after commit
 
 ### Use `protoVersion: 2` when:
 
 - PostgreSQL version is 16+
-- You want support for large/streamed in-progress transactions
-- You want strict rollback safety for streamed transactions
+- You need lower post-commit transfer latency from in-progress streaming
+- You can bound the combined size of open transactions retained in connector memory
 
 ## Configuration Examples
 
@@ -77,7 +78,7 @@ slot:
   name: cdc_slot
   createIfNotExists: true
   slotActivityCheckerInterval: 3000
-  protoVersion: 2
+  protoVersion: 1
 ```
 
 ### Go
@@ -87,7 +88,7 @@ Slot: slot.Config{
     Name:                        "cdc_slot",
     CreateIfNotExists:           true,
     SlotActivityCheckerInterval: 3000,
-    ProtoVersion:                2,
+    ProtoVersion:                1,
 },
 ```
 
@@ -114,10 +115,10 @@ The branch adds/updates tests to protect behavior:
 
 ## Migration Notes
 
-If you do not set `slot.protoVersion`, default is `2`.
+If you do not set `slot.protoVersion`, default is `1`.
 
 Recommended migration path:
 
 1. Upgrade PostgreSQL to version 16 or newer before using this fork.
-2. Keep `protoVersion: 2` unless you intentionally disable streamed transaction handling.
+2. Opt into `protoVersion: 2` only when transaction size is operationally bounded.
 3. Run CDC integration tests with the protocol version used in production.

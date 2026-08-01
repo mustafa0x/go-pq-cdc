@@ -55,7 +55,7 @@ func TestSetDefaultOwnsRuntimeDefaults(t *testing.T) {
 	if cfg.Publication.Tables[0].Schema != "public" {
 		t.Fatalf("table schema = %q", cfg.Publication.Tables[0].Schema)
 	}
-	if cfg.Slot.ProtoVersion != 2 || cfg.Slot.SlotActivityCheckerInterval != time.Second {
+	if cfg.Slot.ProtoVersion != 1 || cfg.Slot.SlotActivityCheckerInterval != time.Second {
 		t.Fatalf("slot defaults = proto %d interval %s", cfg.Slot.ProtoVersion, cfg.Slot.SlotActivityCheckerInterval)
 	}
 }

@@ -112,7 +112,7 @@ func (c *Config) SetDefault() {
 	c.Slot.SlotActivityCheckerInterval = normalizeMillisecondsDuration(c.Slot.SlotActivityCheckerInterval, time.Second)
 
 	if c.Slot.ProtoVersion == 0 {
-		c.Slot.ProtoVersion = 2
+		c.Slot.ProtoVersion = 1
 	}
 
 	if c.Logger.Logger == nil {
